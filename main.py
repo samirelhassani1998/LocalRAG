@@ -7,6 +7,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from image_utils import to_image_part
 from rag_utils import (
     ALLOW_LARGE_FILES,
     DEFAULT_MAX_FILE_MB,
@@ -42,6 +43,7 @@ AVAILABLE_MODELS = [
 
 
 EMBEDDING_MODEL = "text-embedding-3-large"
+VISION_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-5"}
 MAX_INPUT_TOKENS = 300_000
 RESERVE_OUTPUT_TOKENS = 1_000
 MAX_RAG_CONTEXT_TOKENS = 30_000
@@ -50,6 +52,7 @@ MAX_FILES = 5
 MAX_FILE_BYTES = DEFAULT_MAX_FILE_MB * 1024 * 1024
 CHUNK_MAX_CHARS = 4000
 CHUNK_OVERLAP = 400
+MAX_IMAGE_ATTACHMENTS = 5
 
 
 def _init_session_state() -> None:
@@ -72,6 +75,8 @@ def _init_session_state() -> None:
         st.session_state.rag_embedding_model = EMBEDDING_MODEL
     if "chat_attachments" not in st.session_state:
         st.session_state.chat_attachments = []
+    if "chat_images" not in st.session_state:
+        st.session_state.chat_images = []
 
 
 def _reset_chat() -> None:
@@ -397,8 +402,21 @@ def _format_usage(usage: Optional[Dict[str, int]]) -> Optional[str]:
 CODE_BLOCK_PATTERN = re.compile(r"```([\w+-]*)\n(.*?)```", re.DOTALL)
 
 
-def _render_message_content(content: str) -> None:
+def _render_message_content(content: Any) -> None:
     if not content:
+        return
+
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                _render_message_content(part.get("text", ""))
+            elif part.get("type") == "input_image" and part.get("image_url"):
+                st.image(part["image_url"], width=196)
+        return
+
+    if not isinstance(content, str):
         return
 
     last_index = 0
@@ -534,6 +552,8 @@ def _render_chat_interface() -> None:
 
     if "chat_attachments" not in st.session_state:
         st.session_state.chat_attachments = []
+    if "chat_images" not in st.session_state:
+        st.session_state.chat_images = []
 
     with st.form("chat-composer", clear_on_submit=True):
         c1, c2, c3 = st.columns([0.08, 0.72, 0.20])
@@ -561,7 +581,6 @@ def _render_chat_interface() -> None:
                     help_hint += " — Les fichiers plus lourds seront traités par morceaux."
                 st.caption(help_hint)
                 if files:
-                    # ajoute sans dupliquer les mêmes noms+taille
                     existing = {(f.name, f.size) for f in st.session_state.chat_attachments}
                     for f in files:
                         if (f.name, f.size) not in existing:
@@ -578,6 +597,24 @@ def _render_chat_interface() -> None:
                                 continue
                             st.session_state.chat_attachments.append(f)
 
+                img_files = st.file_uploader(
+                    "Images (PNG, JPG, WEBP, GIF)",
+                    type=["png", "jpg", "jpeg", "webp", "gif"],
+                    accept_multiple_files=True,
+                    key="chat_img_uploader",
+                )
+                if img_files:
+                    existing_images = {(f.name, getattr(f, "size", None)) for f in st.session_state.chat_images}
+                    for f in img_files:
+                        if len(st.session_state.chat_images) >= MAX_IMAGE_ATTACHMENTS:
+                            st.warning(f"Maximum {MAX_IMAGE_ATTACHMENTS} images par envoi.")
+                            break
+                        key = (f.name, getattr(f, "size", None))
+                        if key in existing_images:
+                            continue
+                        st.session_state.chat_images.append(f)
+                        existing_images.add(key)
+
         with c2:
             user_text = st.text_input(
                 "Envoyer un message…",
@@ -587,6 +624,15 @@ def _render_chat_interface() -> None:
 
         with c3:
             send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
+
+    if st.session_state.chat_images:
+        img_cols = st.columns(min(4, len(st.session_state.chat_images)))
+        for i, f in enumerate(list(st.session_state.chat_images)):
+            with img_cols[i % len(img_cols)]:
+                st.image(f, caption=f.name, use_container_width=True)
+                if st.button(f"❌ Retirer image {i}", key=f"rm_img_{i}"):
+                    st.session_state.chat_images.pop(i)
+                    st.rerun()
 
     if st.session_state.chat_attachments:
         chip_cols = st.columns(min(len(st.session_state.chat_attachments), 4))
@@ -620,8 +666,6 @@ def _render_chat_interface() -> None:
                 continue
             attachments.append({"name": upload.name, "data": upload.getvalue(), "size": size})
 
-        st.session_state.chat_attachments = []
-
         if oversized:
             st.warning(
                 "\n".join(
@@ -632,17 +676,40 @@ def _render_chat_interface() -> None:
                 )
             )
 
-        if not text_value and not attachments:
+        image_parts = []
+        if st.session_state.chat_images:
+            if len(st.session_state.chat_images) > MAX_IMAGE_ATTACHMENTS:
+                st.session_state.chat_images = st.session_state.chat_images[:MAX_IMAGE_ATTACHMENTS]
+            for f in list(st.session_state.chat_images):
+                try:
+                    image_parts.append(to_image_part(f))
+                except Exception as exc:  # noqa: BLE001 - display in UI
+                    st.warning(f"Image ignorée ({f.name}) : {exc}")
+
+        if not text_value and not attachments and not image_parts:
             st.info("Veuillez saisir un message ou ajouter des pièces jointes.")
             return
 
-        user_payload: Dict[str, Any] = {
-            "role": "user",
-            "content": text_value or "(Pièces jointes uniquement)",
-        }
+        selected_model = st.session_state.selected_model
+        if image_parts and selected_model not in VISION_MODELS:
+            st.warning("Ce modèle n’accepte pas d’images, choisissez gpt-4o/mini/gpt-5.")
+            return
+
+        if image_parts:
+            text_part = text_value or "(image)"
+            user_content: Any = [
+                {"type": "text", "text": text_part},
+                *image_parts,
+            ]
+        else:
+            user_content = text_value or "(Pièces jointes uniquement)"
+
+        user_payload: Dict[str, Any] = {"role": "user", "content": user_content}
         if attachments:
             user_payload["attachments"] = attachments
         st.session_state.messages.append(user_payload)
+        st.session_state.chat_attachments = []
+        st.session_state.chat_images = []
 
         with st.chat_message("user"):
             _render_message_content(user_payload["content"])
