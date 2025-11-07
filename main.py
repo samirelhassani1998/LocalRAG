@@ -8,6 +8,8 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from responses_schema import to_responses_input
+
 from image_utils import to_image_part
 from rag_utils import (
     ALLOW_LARGE_FILES,
@@ -469,9 +471,10 @@ def stream_via_responses(
     on_error,
 ) -> None:
     try:
+        payload = to_responses_input(list(payload_messages))
         with client.responses.stream(
             model=model,
-            input=payload_messages,
+            input=payload,
         ) as stream:
             for event in stream:
                 try:
@@ -901,11 +904,10 @@ def _render_chat_interface() -> None:
             return
 
         if image_parts:
-            text_part = text_value or "(image)"
-            user_content: Any = [
-                {"type": "text", "text": text_part},
-                *image_parts,
-            ]
+            user_content = []
+            if text_value:
+                user_content.append({"type": "input_text", "text": text_value})
+            user_content.extend(image_parts)
         else:
             user_content = text_value or "(Pièces jointes uniquement)"
 
