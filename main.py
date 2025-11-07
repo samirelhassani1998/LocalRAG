@@ -8,7 +8,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from responses_schema import to_responses_input
+from adapters import to_chat_messages, to_responses_input
 
 from image_utils import to_image_part
 from rag_utils import (
@@ -56,6 +56,18 @@ MAX_FILE_BYTES = DEFAULT_MAX_FILE_MB * 1024 * 1024
 CHUNK_MAX_CHARS = 4000
 CHUNK_OVERLAP = 400
 MAX_IMAGE_ATTACHMENTS = 5
+
+
+def _contains_image_parts(message: Optional[Dict[str, Any]]) -> bool:
+    if not message:
+        return False
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if isinstance(part, dict) and part.get("type") in {"input_image", "image_url"}:
+            return True
+    return False
 
 
 def _init_session_state() -> None:
@@ -505,9 +517,10 @@ def stream_via_chat_completions(
     on_error,
 ) -> None:
     try:
+        payload = to_chat_messages(list(payload_messages))
         stream = client.chat.completions.create(
             model=model,
-            messages=payload_messages,
+            messages=payload,
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -546,10 +559,9 @@ def call_llm(
         (message for message in reversed(payload_messages) if message.get("role") == "user"),
         None,
     )
-    is_multimodal = isinstance(last_user.get("content") if last_user else None, list)
+    has_images = _contains_image_parts(last_user)
 
-    vision_capable = {"gpt-4o", "gpt-4o-mini", "gpt-5"}
-    if is_multimodal and model not in vision_capable:
+    if has_images and model not in VISION_MODELS:
         on_error(
             ValueError(
                 "Ce modèle n’accepte pas d’images. Choisissez gpt-4o / gpt-4o-mini / gpt-5."
@@ -557,7 +569,7 @@ def call_llm(
         )
         return
 
-    if is_multimodal:
+    if has_images:
         stream_via_responses(client, model, payload_messages, on_delta, on_done, on_error)
     else:
         stream_via_chat_completions(client, model, payload_messages, on_delta, on_done, on_error)
@@ -906,7 +918,7 @@ def _render_chat_interface() -> None:
         if image_parts:
             user_content = []
             if text_value:
-                user_content.append({"type": "input_text", "text": text_value})
+                user_content.append({"type": "text", "text": text_value})
             user_content.extend(image_parts)
         else:
             user_content = text_value or "(Pièces jointes uniquement)"
@@ -1021,10 +1033,7 @@ def _render_chat_interface() -> None:
             (msg for msg in reversed(messages_for_api) if msg.get("role") == "user"),
             None,
         )
-        is_multimodal_request = isinstance(
-            last_user_for_api.get("content") if last_user_for_api else None,
-            list,
-        )
+        is_multimodal_request = _contains_image_parts(last_user_for_api)
 
         call_context: Dict[str, Any] = {
             "model": selected_model,
