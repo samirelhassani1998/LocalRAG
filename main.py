@@ -1,5 +1,6 @@
 import os
 import re
+import urllib.parse as _url
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from token_utils import (
     truncate_context_text,
     truncate_messages_to_budget,
 )
+from utils.rendering import extract_code_block, try_extract_dbml_heuristic
 
 load_dotenv()
 
@@ -59,6 +61,30 @@ MAX_FILE_BYTES = DEFAULT_MAX_FILE_MB * 1024 * 1024
 CHUNK_MAX_CHARS = 4000
 CHUNK_OVERLAP = 400
 MAX_IMAGE_ATTACHMENTS = 5
+
+
+BASE_GLOBAL_SYSTEM_PROMPT = (
+    "Tu es un assistant conversationnel utile et professionnel. Réponds en français lorsque c'est pertinent."
+)
+FORMAT_ENFORCEMENT_BLOCK = """
+FORMAT DE SORTIE OBLIGATOIRE
+1. Un titre H3.
+2. Un résumé en puces (3–5 bullets max).
+3. Un bloc de code unique correctement délimité par des backticks, avec la bonne étiquette :
+   - DBML → ```dbml
+   - SQL  → ```sql
+   - Python → ```python
+   - JSON → ```json
+Ne jamais mettre de texte après le bloc de code.
+Si l’utilisateur demande un modèle DBML, produire exclusivement un bloc ```dbml.
+"""
+
+GLOBAL_SYSTEM_PROMPT = BASE_GLOBAL_SYSTEM_PROMPT + "\n\n" + FORMAT_ENFORCEMENT_BLOCK
+GLOBAL_SYSTEM_MESSAGE = {"role": "system", "content": GLOBAL_SYSTEM_PROMPT}
+
+DBML_ENFORCEMENT_PROMPT = (
+    "Quand l’utilisateur mentionne DBML/dbdiagram, renvoie UNIQUEMENT un bloc ```dbml sans explication après."
+)
 
 
 def _contains_image_parts(message: Optional[Dict[str, Any]]) -> bool:
@@ -91,7 +117,7 @@ def _init_session_state() -> None:
         env_key = os.getenv("OPENAI_API_KEY")
         st.session_state.api_key = env_key if env_key else None
     if "messages" not in st.session_state:
-        st.session_state.messages = []
+        st.session_state.messages = [dict(GLOBAL_SYSTEM_MESSAGE)]
     if "selected_model" not in st.session_state:
         st.session_state.selected_model = AVAILABLE_MODELS[0]
     if "rag_index" not in st.session_state:
@@ -115,7 +141,7 @@ def _init_session_state() -> None:
 
 
 def _reset_chat() -> None:
-    st.session_state.messages = []
+    st.session_state.messages = [dict(GLOBAL_SYSTEM_MESSAGE)]
 
 
 def _reset_rag_state() -> None:
@@ -696,7 +722,70 @@ def call_llm(
 CODE_BLOCK_PATTERN = re.compile(r"```([\w+-]*)\n(.*?)```", re.DOTALL)
 
 
-def _render_message_content(content: Any) -> None:
+def _ensure_global_system_message() -> None:
+    messages = st.session_state.messages
+    if not isinstance(messages, list):
+        st.session_state.messages = [dict(GLOBAL_SYSTEM_MESSAGE)]
+        return
+    if not any(
+        msg.get("role") == "system" and msg.get("content") == GLOBAL_SYSTEM_PROMPT
+        for msg in messages
+    ):
+        st.session_state.messages.insert(0, dict(GLOBAL_SYSTEM_MESSAGE))
+
+
+def _next_render_counter() -> str:
+    counter = st.session_state.get("_render_counter", 0)
+    st.session_state["_render_counter"] = counter + 1
+    return f"render-{counter}"
+
+
+def render_answer_markdown_or_code(
+    raw_text: str,
+    *,
+    preferred_lang: Optional[str] = None,
+    dbml_mode: bool = False,
+) -> None:
+    key_root = _next_render_counter()
+    target_lang = "dbml" if dbml_mode else preferred_lang
+    lang, code = extract_code_block(raw_text, target_lang)
+
+    if dbml_mode and code is None:
+        code = try_extract_dbml_heuristic(raw_text)
+        if code:
+            lang = "dbml"
+
+    if code:
+        st.code(code, language=(lang or "text"))
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            st.download_button(
+                "💾 Télécharger",
+                code,
+                file_name=f"modele.{(lang or 'txt')}",
+                key=f"{key_root}-download",
+            )
+        with c2:
+            st.button(
+                "📋 Copier",
+                key=f"{key_root}-copy",
+                on_click=lambda text=code: st.session_state.__setitem__("__copy__", text),
+            )
+        with c3:
+            if (lang or "").lower() == "dbml":
+                url = "https://dbdiagram.io/d/new?code=" + _url.quote(code)
+                st.link_button("↗️ Ouvrir sur dbdiagram.io", url, key=f"{key_root}-dbdiagram")
+    else:
+        st.markdown(raw_text)
+
+
+def _render_message_content(
+    content: Any,
+    *,
+    role: str = "assistant",
+    preferred_lang: Optional[str] = None,
+    dbml_mode: bool = False,
+) -> None:
     if not content:
         return
 
@@ -705,12 +794,25 @@ def _render_message_content(content: Any) -> None:
             if not isinstance(part, dict):
                 continue
             if part.get("type") == "text":
-                _render_message_content(part.get("text", ""))
+                _render_message_content(
+                    part.get("text", ""),
+                    role=role,
+                    preferred_lang=preferred_lang,
+                    dbml_mode=dbml_mode,
+                )
             elif part.get("type") == "input_image" and part.get("image_url"):
                 st.image(part["image_url"], width=196)
         return
 
     if not isinstance(content, str):
+        return
+
+    if role == "assistant":
+        render_answer_markdown_or_code(
+            content,
+            preferred_lang=preferred_lang,
+            dbml_mode=dbml_mode,
+        )
         return
 
     last_index = 0
@@ -734,6 +836,9 @@ def _render_message_content(content: Any) -> None:
 
 
 def _render_chat_interface() -> None:
+    _ensure_global_system_message()
+    st.session_state["_render_counter"] = 0
+
     def _extract_text_from_response_output(output: Any) -> str:
         if not output:
             return ""
@@ -841,8 +946,14 @@ def _render_chat_interface() -> None:
     for message in st.session_state.messages:
         if message["role"] == "system":
             continue
+        render_opts = message.get("render_options") or {}
         with st.chat_message(message["role"]):
-            _render_message_content(message.get("content", ""))
+            _render_message_content(
+                message.get("content", ""),
+                role=message.get("role", "assistant"),
+                preferred_lang=render_opts.get("preferred_lang"),
+                dbml_mode=render_opts.get("dbml_mode", False),
+            )
             if message["role"] == "user" and message.get("attachments"):
                 attachments = message.get("attachments") or []
                 chips = " ".join(
@@ -863,7 +974,7 @@ def _render_chat_interface() -> None:
             if usage_text:
                 st.caption(usage_text)
 
-    if not st.session_state.messages:
+    if not any(msg.get("role") != "system" for msg in st.session_state.messages):
         st.markdown(
             """
             <div class='empty-state'>
@@ -976,6 +1087,9 @@ def _render_chat_interface() -> None:
 
     if send:
         text_value = user_text.strip() if user_text else ""
+        dbml_requested = bool(
+            re.search(r"\b(dbml|dbdiagram)\b", text_value, re.IGNORECASE)
+        )
         attachments: List[Dict[str, Any]] = []
         oversized: List[tuple[str, int]] = []
 
@@ -1048,8 +1162,16 @@ def _render_chat_interface() -> None:
         st.session_state.chat_attachments = []
         st.session_state.chat_images = []
 
+        if dbml_requested and not any(
+            msg.get("role") == "system" and msg.get("content") == DBML_ENFORCEMENT_PROMPT
+            for msg in st.session_state.messages
+        ):
+            st.session_state.messages.insert(
+                0, {"role": "system", "content": DBML_ENFORCEMENT_PROMPT}
+            )
+
         with st.chat_message("user"):
-            _render_message_content(user_payload["content"])
+            _render_message_content(user_payload["content"], role="user")
             if attachments:
                 chips = " ".join(
                     [f"<span class='attachment-chip'>{escape(a['name'])}</span>" for a in attachments]
@@ -1087,10 +1209,11 @@ def _render_chat_interface() -> None:
             for warn in indexing_stats["warnings"]:
                 st.warning(warn)
 
+        _ensure_global_system_message()
+
         messages_for_api = [
-            {"role": msg["role"], "content": msg["content"]}
+            {"role": msg.get("role"), "content": msg.get("content")}
             for msg in st.session_state.messages
-            if msg["role"] != "system"
         ]
 
         client = OpenAI(api_key=st.session_state.api_key)
@@ -1210,9 +1333,9 @@ def _render_chat_interface() -> None:
                     return
                 if not first_token_displayed:
                     status_box.empty()
+                    answer_box.markdown("_Rédaction en cours…_")
                     first_token_displayed = True
                 acc.append(text)
-                answer_box.markdown("".join(acc))
 
             def on_done(result: Any) -> None:
                 status_box.empty()
@@ -1226,8 +1349,17 @@ def _render_chat_interface() -> None:
                 if not final_text:
                     final_text = ""
 
+                render_opts: Dict[str, Any] = {}
                 if final_text:
-                    _render_message_content(final_text)
+                    preferred_lang = "dbml" if dbml_requested else None
+                    if dbml_requested:
+                        render_opts = {"preferred_lang": preferred_lang, "dbml_mode": True}
+                    _render_message_content(
+                        final_text,
+                        role="assistant",
+                        preferred_lang=preferred_lang,
+                        dbml_mode=dbml_requested,
+                    )
                 else:
                     st.info("Aucune réponse texte reçue.")
 
@@ -1250,14 +1382,15 @@ def _render_chat_interface() -> None:
                 if usage_text:
                     usage_placeholder.caption(usage_text)
 
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": final_text,
-                        "usage": usage_holder["usage"],
-                        "sources": sources_info if sources_info else None,
-                    }
-                )
+                message_entry: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": final_text,
+                    "usage": usage_holder["usage"],
+                    "sources": sources_info if sources_info else None,
+                }
+                if render_opts:
+                    message_entry["render_options"] = render_opts
+                st.session_state.messages.append(message_entry)
 
                 call_context["usage"] = usage_holder["usage"]
                 call_context["response_chars"] = len(final_text)
