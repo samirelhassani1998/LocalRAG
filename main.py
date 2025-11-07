@@ -295,11 +295,21 @@ def _render_sidebar() -> Dict[str, Any]:
         st.markdown("### Données")
         uploaded_files = st.file_uploader(
             "📎 Importer des fichiers",
-            type=["csv", "tsv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
+            type=[
+                "csv",
+                "tsv",
+                "xlsx",
+                "xls",
+                "pdf",
+                "docx",
+                "txt",
+                "md",
+                "json",
+            ],
             accept_multiple_files=True,
         )
         help_hint = (
-            f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, XLSX, XLS, PDF, DOCX, TXT, MD"
+            f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
         )
         if ALLOW_LARGE_FILES:
             help_hint += " — Les fichiers plus lourds seront traités par morceaux."
@@ -531,11 +541,21 @@ def _render_chat_interface() -> None:
             with st.popover("📎", use_container_width=True):
                 files = st.file_uploader(
                     "Importer des fichiers",
-                    type=["csv", "tsv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
+                    type=[
+                        "csv",
+                        "tsv",
+                        "xlsx",
+                        "xls",
+                        "pdf",
+                        "docx",
+                        "txt",
+                        "md",
+                        "json",
+                    ],
                     accept_multiple_files=True,
                 )
                 help_hint = (
-                    f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, XLSX, XLS, PDF, DOCX, TXT, MD"
+                    f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
                 )
                 if ALLOW_LARGE_FILES:
                     help_hint += " — Les fichiers plus lourds seront traités par morceaux."

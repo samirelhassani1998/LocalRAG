@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
 import re
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -38,6 +39,11 @@ except ImportError as exc:  # pragma: no cover - surfaced during ingestion
 else:  # pragma: no cover
     DOCX_IMPORT_ERROR = None
 
+try:  # pragma: no cover - optional dependency for streaming JSON
+    import ijson
+except ImportError:  # pragma: no cover - fallback to in-memory parsing
+    ijson = None
+
 from pypdf import PdfReader
 
 
@@ -67,7 +73,15 @@ CSV_EXTENSIONS = {"csv", "tsv"}
 EXCEL_EXTENSIONS = {"xlsx", "xls"}
 PDF_EXTENSIONS = {"pdf"}
 DOCX_EXTENSIONS = {"docx"}
-SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | CSV_EXTENSIONS | EXCEL_EXTENSIONS | PDF_EXTENSIONS | DOCX_EXTENSIONS
+JSON_EXTENSIONS = {"json"}
+SUPPORTED_EXTENSIONS = (
+    TEXT_EXTENSIONS
+    | CSV_EXTENSIONS
+    | EXCEL_EXTENSIONS
+    | PDF_EXTENSIONS
+    | DOCX_EXTENSIONS
+    | JSON_EXTENSIONS
+)
 
 
 def format_bytes(n: int) -> str:
@@ -243,6 +257,219 @@ def _bytes_to_text(data: bytes) -> str:
         return data.decode(encoding)
     except (LookupError, UnicodeDecodeError):
         return data.decode("utf-8", errors="ignore")
+
+
+def _json_scalar_to_str(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _flatten_json_iter(value: Any, prefix: Optional[str] = None) -> Iterator[Tuple[str, str]]:
+    if isinstance(value, dict):
+        if not value:
+            path = prefix or "value"
+            yield path, "{}"
+            return
+        for key, child in value.items():
+            key_str = str(key)
+            new_prefix = f"{prefix}.{key_str}" if prefix else key_str
+            yield from _flatten_json_iter(child, new_prefix)
+        return
+    if isinstance(value, list):
+        if not value:
+            path = prefix or "value"
+            yield path, "[]"
+            return
+        for idx, child in enumerate(value):
+            new_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            yield from _flatten_json_iter(child, new_prefix)
+        return
+    path = prefix or "value"
+    yield path, _json_scalar_to_str(value)
+
+
+def _json_structure_to_text(
+    value: Any,
+    prefix: Optional[str] = None,
+    *,
+    allow_tabular: bool = True,
+) -> str:
+    if isinstance(value, list):
+        if allow_tabular and value and all(isinstance(item, dict) for item in value):
+            try:
+                table = pd.json_normalize(value)
+            except Exception:
+                table = None
+            else:
+                if not table.empty:
+                    return table.to_csv(index=False)
+        if not value:
+            path = prefix or "value"
+            return f"{path} = []"
+        parts: List[str] = []
+        for idx, item in enumerate(value):
+            item_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            part = _json_structure_to_text(
+                item,
+                prefix=item_prefix,
+                allow_tabular=allow_tabular,
+            )
+            if part:
+                parts.append(part)
+        return "\n\n".join(parts)
+    if isinstance(value, dict):
+        if not value:
+            path = prefix or "value"
+            return f"{path} = {{}}"
+        lines = [
+            f"{path} = {scalar}"
+            for path, scalar in _flatten_json_iter(value, prefix)
+        ]
+        return "\n".join(lines)
+    path = prefix or "value"
+    return f"{path} = {_json_scalar_to_str(value)}"
+
+
+def parse_json_bytes(data: bytes) -> str:
+    """Parse JSON or NDJSON content fully in memory and return text."""
+
+    decoded = data.decode("utf-8", "ignore")
+    try:
+        parsed = json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        records: List[Any] = []
+        for raw_line in decoded.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if not records:
+            raise ValueError("Contenu JSON invalide ou vide.") from exc
+        text = _json_structure_to_text(records)
+    else:
+        text = _json_structure_to_text(parsed)
+
+    text = text.strip()
+    if len(text) > MAX_TOTAL_CHARS:
+        return text[:MAX_TOTAL_CHARS]
+    return text
+
+
+def parse_json_streaming(data: bytes) -> Iterator[str]:
+    """Stream JSON/NDJSON content into textual blocks limited by MAX_TOTAL_CHARS."""
+
+    if ijson is None:
+        yield parse_json_bytes(data)
+        return
+
+    total_chars = 0
+    buffer: List[str] = []
+    buffer_len = 0
+
+    def emit_buffer() -> Optional[str]:
+        nonlocal buffer, buffer_len, total_chars
+        if not buffer:
+            return None
+        chunk = "\n\n".join(buffer).strip()
+        buffer = []
+        buffer_len = 0
+        if not chunk:
+            return None
+        remaining = MAX_TOTAL_CHARS - total_chars
+        if remaining <= 0:
+            return None
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining]
+        total_chars += len(chunk)
+        return chunk
+
+    def append_text(text: str) -> Optional[str]:
+        nonlocal buffer_len
+        stripped = text.strip()
+        if not stripped:
+            return None
+        if len(stripped) > MAX_TOTAL_CHARS:
+            stripped = stripped[:MAX_TOTAL_CHARS]
+        buffer.append(stripped)
+        buffer_len += len(stripped)
+        threshold = max(10_000, MAX_TOTAL_CHARS // 4)
+        if buffer_len >= threshold or total_chars + buffer_len >= MAX_TOTAL_CHARS:
+            return emit_buffer()
+        return None
+
+    bio = BytesIO(data)
+    emitted = False
+    try:
+        for idx, item in enumerate(ijson.items(bio, "item"), start=1):
+            if total_chars >= MAX_TOTAL_CHARS:
+                break
+            text = _json_structure_to_text(
+                item,
+                prefix=f"item[{idx}]",
+                allow_tabular=False,
+            )
+            maybe_chunk = append_text(text)
+            if maybe_chunk:
+                emitted = True
+                yield maybe_chunk
+            if total_chars >= MAX_TOTAL_CHARS:
+                break
+        final_chunk = emit_buffer()
+        if final_chunk:
+            emitted = True
+            yield final_chunk
+        if emitted:
+            return
+    except ijson.JSONError:
+        pass
+
+    bio.seek(0)
+    try:
+        for line_no, raw_line in enumerate(bio, start=1):
+            if total_chars >= MAX_TOTAL_CHARS:
+                break
+            line = raw_line.decode("utf-8", "ignore").strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = _json_structure_to_text(
+                item,
+                prefix=f"line[{line_no}]",
+                allow_tabular=False,
+            )
+            maybe_chunk = append_text(text)
+            if maybe_chunk:
+                emitted = True
+                yield maybe_chunk
+            if total_chars >= MAX_TOTAL_CHARS:
+                break
+        final_chunk = emit_buffer()
+        if final_chunk:
+            emitted = True
+            yield final_chunk
+        if emitted:
+            return
+    except Exception:
+        pass
+
+    fallback = parse_json_bytes(data)
+    if fallback:
+        if len(fallback) > MAX_TOTAL_CHARS:
+            fallback = fallback[:MAX_TOTAL_CHARS]
+        yield fallback
 
 
 def _ingest_text_document(
@@ -467,6 +694,50 @@ def _ingest_docx(
     return chunks, summary, []
 
 
+def _ingest_json(
+    name: str,
+    data: bytes,
+    *,
+    size_bytes: int,
+    max_chars: int,
+    overlap: int,
+) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
+    stream_mode = should_stream_file(size_bytes)
+    try:
+        blocks: Iterable[str]
+        if stream_mode:
+            blocks = parse_json_streaming(data)
+        else:
+            blocks = [parse_json_bytes(data)]
+    except ValueError as exc:
+        return [], {}, [f"Erreur lors de la lecture JSON {name}: {exc}"]
+
+    chunks: List[DocumentChunk] = []
+    token_estimate = 0
+    for block_index, block in enumerate(blocks, start=1):
+        if not block:
+            continue
+        for chunk in chunk_text(block, max_chars=max_chars, overlap=overlap):
+            meta: Dict[str, Any] = {"source": name, "type": "json"}
+            if stream_mode:
+                meta["segment"] = block_index
+            chunks.append(DocumentChunk(text=chunk, meta=meta))
+            token_estimate += _estimate_tokens(chunk)
+
+    warnings: List[str] = []
+    if not chunks:
+        warnings.append(f"Le fichier JSON {name} ne contient pas de contenu exploitable.")
+
+    summary = {
+        "name": name,
+        "type": "json",
+        "size_bytes": size_bytes,
+        "chunk_count": len(chunks),
+        "token_estimate": token_estimate,
+    }
+    return chunks, summary, warnings
+
+
 def load_file_to_chunks(uploaded_file, max_chars: int = 4000, overlap: int = 400) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
     name = uploaded_file.name
     extension = name.split(".")[-1].lower()
@@ -494,6 +765,14 @@ def load_file_to_chunks(uploaded_file, max_chars: int = 4000, overlap: int = 400
         return _ingest_pdf(name, data, max_chars=max_chars, overlap=overlap, stream=stream_mode)
     if extension in DOCX_EXTENSIONS:
         return _ingest_docx(name, data, max_chars=max_chars, overlap=overlap)
+    if extension in JSON_EXTENSIONS:
+        return _ingest_json(
+            name,
+            data,
+            size_bytes=size,
+            max_chars=max_chars,
+            overlap=overlap,
+        )
 
     return [], {}, [f"Extension inconnue : {name}"]
 
@@ -570,6 +849,56 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
         _STATUS_UPDATE_CALLBACK("📥 Lecture des fichiers…", "running")
 
     for name, data, size in normalised:
+        extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+        if extension == "json":
+            stream_mode = should_stream_file(size)
+            try:
+                if stream_mode:
+                    blocks: Iterable[str] = parse_json_streaming(data)
+                else:
+                    blocks = [parse_json_bytes(data)]
+            except ValueError as exc:
+                warn_msg = f"Impossible d'indexer {name} ({format_bytes(size)}): {exc}"
+                st.warning(warn_msg)
+                warnings.append(warn_msg)
+                if _STATUS_WRITE_CALLBACK:
+                    _STATUS_WRITE_CALLBACK(f"❌ {name} : {exc}")
+                continue
+
+            chunk_count = 0
+            token_estimate = 0
+            for block_index, block in enumerate(blocks, start=1):
+                if not block:
+                    continue
+                for chunk in chunk_text(block):
+                    meta: Dict[str, Any] = {"source": name, "type": "json"}
+                    if stream_mode:
+                        meta["segment"] = block_index
+                    chunk_texts.append(chunk)
+                    chunk_metas.append(meta)
+                    chunk_count += 1
+                    token_estimate += _estimate_tokens(chunk)
+
+            if chunk_count == 0:
+                msg = f"⚠️ {name} — aucun contenu JSON exploitable."
+                warnings.append(msg)
+                if _STATUS_WRITE_CALLBACK:
+                    _STATUS_WRITE_CALLBACK(msg)
+                continue
+
+            summary = {
+                "name": name,
+                "type": "json",
+                "size_bytes": size,
+                "chunk_count": chunk_count,
+                "token_estimate": token_estimate,
+            }
+            doc_summaries.append(summary)
+            if _STATUS_WRITE_CALLBACK:
+                _STATUS_WRITE_CALLBACK(f"✔️ {name} — {chunk_count} chunks")
+            continue
+
         in_memory = _InMemoryUploadedFile(name, data)
         try:
             chunks, summary, chunk_warnings = load_file_to_chunks(in_memory)
