@@ -1,5 +1,6 @@
 import os
-from typing import List, Dict
+import re
+from typing import Dict, List, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -110,13 +111,72 @@ def _render_sidebar() -> None:
         st.caption("Votre clé n'est jamais sauvegardée côté serveur.")
 
 
-def _call_openai(messages: List[Dict[str, str]]) -> str:
+def _call_openai(messages: List[Dict[str, str]]):
     client = OpenAI(api_key=st.session_state.api_key)
-    response = client.chat.completions.create(
+    return client.chat.completions.create(
         model=st.session_state.selected_model,
         messages=messages,
+        stream=True,
+        stream_options={"include_usage": True},
     )
-    return response.choices[0].message.content or ""
+
+
+def _usage_to_dict(usage: Optional[object]) -> Optional[Dict[str, int]]:
+    if usage is None:
+        return None
+
+    if isinstance(usage, dict):
+        data = usage
+    else:
+        data = {key: getattr(usage, key, None) for key in ["total_tokens", "prompt_tokens", "completion_tokens"]}
+
+    filtered = {key: value for key, value in data.items() if value is not None}
+    return filtered or None
+
+
+def _format_usage(usage: Optional[Dict[str, int]]) -> Optional[str]:
+    if not usage:
+        return None
+
+    parts = []
+    if "total_tokens" in usage:
+        parts.append(f"Total : {usage['total_tokens']}")
+    if "prompt_tokens" in usage:
+        parts.append(f"Invite : {usage['prompt_tokens']}")
+    if "completion_tokens" in usage:
+        parts.append(f"Réponse : {usage['completion_tokens']}")
+
+    if not parts:
+        return None
+
+    return "Usage tokens — " + ", ".join(parts)
+
+
+CODE_BLOCK_PATTERN = re.compile(r"```([\w+-]*)\n(.*?)```", re.DOTALL)
+
+
+def _render_message_content(content: str) -> None:
+    if not content:
+        return
+
+    last_index = 0
+    for match in CODE_BLOCK_PATTERN.finditer(content):
+        text_segment = content[last_index : match.start()]
+        if text_segment.strip():
+            st.markdown(text_segment)
+        elif text_segment:
+            st.markdown(text_segment)
+
+        language = match.group(1).strip() or None
+        code = match.group(2)
+        st.code(code.rstrip("\n"), language)
+        last_index = match.end()
+
+    remaining_text = content[last_index:]
+    if remaining_text.strip():
+        st.markdown(remaining_text)
+    elif remaining_text:
+        st.markdown(remaining_text)
 
 
 def _render_chat_interface() -> None:
@@ -171,7 +231,10 @@ def _render_chat_interface() -> None:
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            _render_message_content(message.get("content", ""))
+            usage_text = _format_usage(message.get("usage"))
+            if usage_text:
+                st.caption(usage_text)
 
     if not st.session_state.messages:
         st.markdown(
@@ -190,17 +253,42 @@ def _render_chat_interface() -> None:
         user_message = prompt.strip()
         st.session_state.messages.append({"role": "user", "content": user_message})
         with st.chat_message("user"):
-            st.markdown(user_message)
+            _render_message_content(user_message)
+
+        messages_for_api = [
+            {"role": msg["role"], "content": msg["content"]} for msg in st.session_state.messages
+        ]
 
         with st.chat_message("assistant"):
-            placeholder = st.empty()
+            spinner_placeholder = st.empty()
+            stream_placeholder = st.empty()
+            usage_placeholder = st.empty()
+            response_text = ""
+            usage_data = None
+
             try:
-                reply = _call_openai(st.session_state.messages)
-            except Exception as error:  # noqa: BLE001 - handled gracefully for the UI
-                placeholder.error(f"Erreur lors de l'appel à l'API : {error}")
+                with spinner_placeholder.spinner("Assistant est en train d'écrire…"):
+                    for chunk in _call_openai(messages_for_api):
+                        if chunk.choices and chunk.choices[0].delta:
+                            content = chunk.choices[0].delta.content or ""
+                            if content:
+                                response_text += content
+                                stream_placeholder.markdown(response_text)
+                        if getattr(chunk, "usage", None):
+                            usage_data = _usage_to_dict(chunk.usage)
+            except Exception as error:  # noqa: BLE001 - display gracefully in UI
+                spinner_placeholder.empty()
+                stream_placeholder.error(f"Erreur lors de l'appel à l'API : {error}")
             else:
-                placeholder.markdown(reply)
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+                spinner_placeholder.empty()
+                stream_placeholder.empty()
+                _render_message_content(response_text)
+                usage_text = _format_usage(usage_data)
+                if usage_text:
+                    usage_placeholder.caption(usage_text)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": response_text, "usage": usage_data}
+                )
 
 
 if __name__ == "__main__":
