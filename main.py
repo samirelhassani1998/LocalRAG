@@ -1,5 +1,6 @@
 import os
 import re
+from html import escape
 from typing import Any, Dict, List, Optional, Sequence
 
 import streamlit as st
@@ -10,9 +11,12 @@ from rag_utils import (
     FAISS_IMPORT_ERROR,
     add_embeddings_to_index,
     embed_texts,
+    clear_status_callbacks,
+    configure_status_callbacks,
     format_context,
     format_source_badge,
     human_readable_size,
+    index_files_from_chat,
     load_file_to_chunks,
     retrieve,
 )
@@ -55,6 +59,10 @@ def _init_session_state() -> None:
         st.session_state.rag_docs = []
     if "rag_embedding_model" not in st.session_state:
         st.session_state.rag_embedding_model = EMBEDDING_MODEL
+    if "chat_attachments" not in st.session_state:
+        st.session_state.chat_attachments = []
+    if "chat_input" not in st.session_state:
+        st.session_state.chat_input = ""
 
 
 def _reset_chat() -> None:
@@ -422,6 +430,20 @@ def _render_chat_interface() -> None:
             border-radius: 12px;
             padding: 0.75rem 1rem;
         }
+        .attachment-chip-wrapper {
+            margin-top: 0.5rem;
+        }
+        .attachment-chip {
+            display: inline-block;
+            background: #e0f2fe;
+            color: #0f172a;
+            border-radius: 999px;
+            padding: 0.15rem 0.6rem;
+            margin-right: 0.35rem;
+            margin-bottom: 0.25rem;
+            font-size: 0.75rem;
+            border: 1px solid #bae6fd;
+        }
         .chat-header {
             font-size: 1.75rem;
             font-weight: 600;
@@ -448,11 +470,26 @@ def _render_chat_interface() -> None:
     st.markdown("<div class='chat-header'>ChatGPT-like Chatbot</div>", unsafe_allow_html=True)
 
     if _rag_is_ready():
-        st.markdown(f"🧠 **RAG actif** (k={RETRIEVAL_K})")
+        st.markdown(f"🧠 RAG actif (k={RETRIEVAL_K})")
 
     for message in st.session_state.messages:
+        if message["role"] == "system":
+            continue
         with st.chat_message(message["role"]):
             _render_message_content(message.get("content", ""))
+            if message["role"] == "user" and message.get("attachments"):
+                attachments = message.get("attachments") or []
+                chips = " ".join(
+                    [
+                        f"<span class='attachment-chip'>{escape(a['name'])}</span>"
+                        for a in attachments
+                    ]
+                )
+                if chips:
+                    st.markdown(
+                        f"<div class='attachment-chip-wrapper'>{chips}</div>",
+                        unsafe_allow_html=True,
+                    )
             sources_line = _format_sources_line(message.get("sources") or [])
             if sources_line:
                 st.caption(sources_line)
@@ -472,26 +509,149 @@ def _render_chat_interface() -> None:
             unsafe_allow_html=True,
         )
 
-    prompt = st.chat_input("Envoyer un message")
-    if prompt and prompt.strip():
-        user_message = prompt.strip()
-        st.session_state.messages.append({"role": "user", "content": user_message})
+    if "chat_attachments" not in st.session_state:
+        st.session_state.chat_attachments = []
+
+    c1, c2, c3 = st.columns([0.08, 0.72, 0.20])
+    with c1:
+        with st.popover("📎", use_container_width=True):
+            files = st.file_uploader(
+                "Importer des fichiers",
+                type=["csv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
+                accept_multiple_files=True,
+            )
+            if files:
+                # ajoute sans dupliquer les mêmes noms+taille
+                existing = {(f.name, f.size) for f in st.session_state.chat_attachments}
+                for f in files:
+                    if (f.name, f.size) not in existing:
+                        if len(st.session_state.chat_attachments) >= MAX_FILES:
+                            st.warning(f"Maximum {MAX_FILES} fichiers par envoi.")
+                            break
+                        size = getattr(f, "size", None) or len(f.getvalue())
+                        if size > MAX_FILE_SIZE:
+                            st.warning(
+                                f"{f.name} dépasse la limite de 20 Mo et sera ignoré."
+                            )
+                            continue
+                        st.session_state.chat_attachments.append(f)
+
+    with c2:
+        user_text = st.text_input(
+            "Envoyer un message…",
+            label_visibility="collapsed",
+            key="chat_input",
+        )
+
+    with c3:
+        send = st.button("▶️ Envoyer", use_container_width=True)
+
+    if st.session_state.chat_attachments:
+        chip_cols = st.columns(min(len(st.session_state.chat_attachments), 4))
+        for i, f in enumerate(st.session_state.chat_attachments):
+            with chip_cols[i % len(chip_cols)]:
+                st.markdown(f"🧩 **{f.name}**  ({round(f.size/1024,1)} Ko)")
+                if st.button(f"❌ Retirer {i}", key=f"rm_{i}"):
+                    st.session_state.chat_attachments.pop(i)
+                    st.rerun()
+
+    if send:
+        text_value = user_text.strip() if user_text else ""
+        attachments: List[Dict[str, Any]] = []
+        oversized: List[str] = []
+
+        for upload in list(st.session_state.chat_attachments):
+            size = getattr(upload, "size", None)
+            if size is None:
+                try:
+                    size = len(upload.getvalue())
+                except Exception:
+                    size = 0
+            if size and size > MAX_FILE_SIZE:
+                oversized.append(upload.name)
+                continue
+            attachments.append({"name": upload.name, "data": upload.getvalue(), "size": size})
+
+        st.session_state.chat_attachments = []
+
+        if oversized:
+            st.warning(
+                "\n".join(
+                    [
+                        "Les fichiers suivants dépassent 20 Mo et ont été ignorés :",
+                        *[f"• {name}" for name in oversized],
+                    ]
+                )
+            )
+
+        if not text_value and not attachments:
+            st.info("Veuillez saisir un message ou ajouter des pièces jointes.")
+            return
+
+        user_payload: Dict[str, Any] = {
+            "role": "user",
+            "content": text_value or "(Pièces jointes uniquement)",
+        }
+        if attachments:
+            user_payload["attachments"] = attachments
+        st.session_state.messages.append(user_payload)
+
         with st.chat_message("user"):
-            _render_message_content(user_message)
+            _render_message_content(user_payload["content"])
+            if attachments:
+                chips = " ".join(
+                    [f"<span class='attachment-chip'>{escape(a['name'])}</span>" for a in attachments]
+                )
+                if chips:
+                    st.markdown(
+                        f"<div class='attachment-chip-wrapper'>{chips}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+        indexing_stats: Optional[Dict[str, Any]] = None
+        if attachments:
+            try:
+                with st.status("Indexation des pièces jointes…", expanded=False) as s:
+                    configure_status_callbacks(
+                        update=lambda label, state="running": s.update(label=label, state=state),
+                        write=s.write,
+                    )
+                    try:
+                        indexing_stats = index_files_from_chat(attachments)
+                    finally:
+                        clear_status_callbacks()
+                    if (indexing_stats or {}).get("chunks"):
+                        s.update(
+                            label=f"✅ Indexation terminée ({indexing_stats['chunks']} chunks)",
+                            state="complete",
+                        )
+                    else:
+                        s.update(label="⚠️ Aucun contenu indexable", state="error")
+            except Exception as error:  # noqa: BLE001 - surface in UI
+                st.error(f"Indexation impossible : {error}")
+                indexing_stats = None
+
+        if indexing_stats and indexing_stats.get("warnings"):
+            for warn in indexing_stats["warnings"]:
+                st.warning(warn)
 
         messages_for_api = [
-            {"role": msg["role"], "content": msg["content"]} for msg in st.session_state.messages
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in st.session_state.messages
+            if msg["role"] != "system"
         ]
 
         client = OpenAI(api_key=st.session_state.api_key)
-        rag_hits: List[Any] = []
         sources_info: List[Dict[str, Any]] = []
 
-        if _rag_is_ready():
+        use_rag = _rag_is_ready()
+        hits: List[Any] = []
+        if use_rag:
             try:
-                rag_hits = retrieve(
+                query = text_value or "Résume/analyse les documents joints."
+                hits = retrieve(
                     client,
-                    user_message,
+                    query,
                     st.session_state.rag_index,
                     st.session_state.rag_texts,
                     st.session_state.rag_meta,
@@ -500,17 +660,20 @@ def _render_chat_interface() -> None:
                 )
             except Exception as error:  # noqa: BLE001 - surface gracefully
                 st.warning(f"Recherche contextuelle indisponible : {error}")
-                rag_hits = []
+                hits = []
 
-        if rag_hits:
-            context = format_context(rag_hits)
-            system_prompt = (
-                "Tu es un assistant. Utilise EXCLUSIVEMENT les extraits ci-dessous pour répondre. "
-                "Cites les sources entre crochets [n] lorsque pertinent. Si l’info manque, dis-le.\n"
-                f"Extraits :\n{context}"
-            )
-            messages_for_api = [{"role": "system", "content": system_prompt}] + messages_for_api
-            sources_info = _build_source_entries(rag_hits)
+        if hits:
+            context = format_context(hits)
+            sys_prefix = {
+                "role": "system",
+                "content": (
+                    "Tu es un assistant. Utilise EXCLUSIVEMENT les extraits ci-dessous pour répondre. "
+                    "Cites les sources entre crochets [n]. Si l’info manque, dis-le.\n\nExtraits :\n"
+                    + context
+                ),
+            }
+            messages_for_api = [sys_prefix] + messages_for_api
+            sources_info = _build_source_entries(hits)
 
         with st.chat_message("assistant"):
             status_box = st.empty()
@@ -543,9 +706,20 @@ def _render_chat_interface() -> None:
                 status_box.empty()
                 answer_box.empty()
                 _render_message_content(response_text)
-                sources_line = _format_sources_line(sources_info)
-                if sources_line:
-                    sources_placeholder.caption(sources_line)
+                if hits:
+                    sources_placeholder.markdown(
+                        "Sources : "
+                        + " • ".join(
+                            [
+                                format_source_badge(hit[1], idx + 1)
+                                for idx, hit in enumerate(hits)
+                            ]
+                        )
+                    )
+                else:
+                    sources_line = _format_sources_line(sources_info)
+                    if sources_line:
+                        sources_placeholder.caption(sources_line)
                 usage_text = _format_usage(usage_data)
                 if usage_text:
                     usage_placeholder.caption(usage_text)
@@ -557,6 +731,9 @@ def _render_chat_interface() -> None:
                         "sources": sources_info if sources_info else None,
                     }
                 )
+
+        st.session_state.chat_input = ""
+        st.rerun()
 
 
 if __name__ == "__main__":
