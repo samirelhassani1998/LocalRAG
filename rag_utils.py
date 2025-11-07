@@ -5,13 +5,14 @@ import io
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from openai import OpenAI
 
 import chardet
+import streamlit as st
 
 try:  # pragma: no cover - handled gracefully at runtime
     import faiss
@@ -43,6 +44,30 @@ EXCEL_EXTENSIONS = {"xlsx", "xls"}
 PDF_EXTENSIONS = {"pdf"}
 DOCX_EXTENSIONS = {"docx"}
 SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | CSV_EXTENSIONS | EXCEL_EXTENSIONS | PDF_EXTENSIONS | DOCX_EXTENSIONS
+
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
+CHAT_MAX_FILES = 5
+CHAT_MAX_FILE_SIZE = 20 * 1024 * 1024
+
+_STATUS_UPDATE_CALLBACK: Optional[Callable[[str, str], None]] = None
+_STATUS_WRITE_CALLBACK: Optional[Callable[[str], None]] = None
+
+
+def configure_status_callbacks(
+    update: Optional[Callable[[str, str], None]] = None,
+    write: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Expose callbacks so Streamlit can reflect indexing progress."""
+
+    global _STATUS_UPDATE_CALLBACK, _STATUS_WRITE_CALLBACK
+    _STATUS_UPDATE_CALLBACK = update
+    _STATUS_WRITE_CALLBACK = write
+
+
+def clear_status_callbacks() -> None:
+    """Reset progress callbacks after indexing."""
+
+    configure_status_callbacks(None, None)
 
 
 @dataclass
@@ -340,6 +365,151 @@ def load_file_to_chunks(uploaded_file, max_chars: int = 4000, overlap: int = 400
         return _ingest_docx(name, data, max_chars=max_chars, overlap=overlap)
 
     return [], {}, [f"Extension inconnue : {name}"]
+
+
+class _InMemoryUploadedFile:
+    """Minimal wrapper to reuse ingestion pipeline with in-memory bytes."""
+
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data or b""
+        self.size = len(self._data)
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def _normalise_chat_files(files: Sequence[Any]) -> List[Tuple[str, bytes, int]]:
+    normalised: List[Tuple[str, bytes, int]] = []
+    for file in files:
+        if file is None:
+            continue
+        if isinstance(file, dict):
+            name = str(file.get("name") or "document")
+            data = file.get("data") or b""
+            if not isinstance(data, (bytes, bytearray)):
+                data = bytes(data)
+            size = int(file.get("size") or len(data))
+        else:
+            name = getattr(file, "name", "document")
+            try:
+                data = file.getvalue()
+            except Exception:  # noqa: BLE001 - best effort fallback
+                data = b""
+            size = getattr(file, "size", None)
+            if size is None:
+                size = len(data)
+        normalised.append((name, bytes(data), int(size)))
+    return normalised
+
+
+def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
+    """Index chat attachments into the shared FAISS store."""
+
+    if not files:
+        return {"documents": 0, "chunks": 0, "warnings": []}
+
+    if FAISS_IMPORT_ERROR is not None:
+        raise RuntimeError(f"faiss-cpu est requis pour activer le RAG : {FAISS_IMPORT_ERROR}")
+
+    api_key = st.session_state.get("api_key")
+    if not api_key:
+        raise RuntimeError("Aucune clé API disponible pour l'indexation.")
+
+    normalised = _normalise_chat_files(files)
+    if not normalised:
+        return {"documents": 0, "chunks": 0, "warnings": []}
+
+    warnings: List[str] = []
+    chunk_texts: List[str] = []
+    chunk_metas: List[Dict[str, Any]] = []
+    doc_summaries: List[Dict[str, Any]] = []
+
+    if len(normalised) > CHAT_MAX_FILES:
+        warnings.append(
+            f"Seuls les {CHAT_MAX_FILES} premiers fichiers ont été indexés sur {len(normalised)} fournis."
+        )
+        if _STATUS_WRITE_CALLBACK:
+            _STATUS_WRITE_CALLBACK(
+                f"ℹ️ Seuls les {CHAT_MAX_FILES} premiers fichiers seront traités."
+            )
+        normalised = normalised[:CHAT_MAX_FILES]
+
+    if _STATUS_UPDATE_CALLBACK:
+        _STATUS_UPDATE_CALLBACK("📥 Lecture des fichiers…", "running")
+
+    for name, data, size in normalised:
+        if size > CHAT_MAX_FILE_SIZE:
+            warnings.append(f"{name} dépasse 20 Mo et a été ignoré.")
+            if _STATUS_WRITE_CALLBACK:
+                _STATUS_WRITE_CALLBACK(f"⚠️ {name} — dépasse 20 Mo, ignoré.")
+            continue
+
+        in_memory = _InMemoryUploadedFile(name, data)
+        try:
+            chunks, summary, chunk_warnings = load_file_to_chunks(in_memory)
+        except Exception as exc:  # noqa: BLE001 - feedback in UI
+            warnings.append(f"{name} : {exc}")
+            if _STATUS_WRITE_CALLBACK:
+                _STATUS_WRITE_CALLBACK(f"❌ {name} : {exc}")
+            continue
+
+        if summary:
+            doc_summaries.append(summary)
+        if chunk_warnings:
+            warnings.extend(chunk_warnings)
+            if _STATUS_WRITE_CALLBACK:
+                for warn in chunk_warnings:
+                    _STATUS_WRITE_CALLBACK(f"⚠️ {warn}")
+        if not chunks:
+            warnings.append(f"⚠️ {name} — aucun texte exploitable.")
+            if _STATUS_WRITE_CALLBACK:
+                _STATUS_WRITE_CALLBACK(f"⚠️ {name} — aucun texte exploitable.")
+            continue
+
+        for chunk in chunks:
+            chunk_texts.append(chunk.text)
+            chunk_metas.append(chunk.meta)
+        if _STATUS_WRITE_CALLBACK:
+            _STATUS_WRITE_CALLBACK(f"✔️ {name} — {len(chunks)} chunks")
+
+    if not chunk_texts:
+        return {"documents": 0, "chunks": 0, "warnings": warnings}
+
+    if _STATUS_UPDATE_CALLBACK:
+        _STATUS_UPDATE_CALLBACK("🧠 Calcul des embeddings…", "running")
+
+    client = OpenAI(api_key=api_key)
+    embedding_model = st.session_state.get("rag_embedding_model") or DEFAULT_EMBEDDING_MODEL
+    embeddings = embed_texts(client, embedding_model, chunk_texts)
+
+    if embeddings.size == 0:
+        warnings.append("Impossible de calculer les embeddings pour les pièces jointes.")
+        if _STATUS_WRITE_CALLBACK:
+            _STATUS_WRITE_CALLBACK("❌ Échec du calcul des embeddings.")
+        return {"documents": len(doc_summaries), "chunks": 0, "warnings": warnings}
+
+    if _STATUS_UPDATE_CALLBACK:
+        _STATUS_UPDATE_CALLBACK("📚 Mise à jour de l'index FAISS…", "running")
+
+    try:
+        st.session_state.rag_index = add_embeddings_to_index(
+            st.session_state.get("rag_index"),
+            embeddings,
+        )
+    except Exception as exc:  # noqa: BLE001 - propagate as runtime error
+        raise RuntimeError(f"Impossible de mettre à jour l'index FAISS : {exc}") from exc
+
+    st.session_state.rag_texts.extend(chunk_texts)
+    st.session_state.rag_meta.extend(chunk_metas)
+    st.session_state.rag_docs.extend(doc_summaries)
+    st.session_state.rag_embedding_model = embedding_model
+
+    return {
+        "documents": len(doc_summaries),
+        "chunks": len(chunk_texts),
+        "warnings": warnings,
+    }
 
 
 def embed_texts(client: OpenAI, model: str, texts: Sequence[str]) -> np.ndarray:
