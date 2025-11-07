@@ -10,6 +10,7 @@ import streamlit as st
 try:  # Prefer the modern OpenAI client when available.
     from openai import OpenAI
     from openai import OpenAIError
+
     _import_error: Exception | None = None
     _legacy_openai = None
 except ImportError as exc:  # pragma: no cover - fallback for older OpenAI clients.
@@ -58,6 +59,25 @@ def _call_openai(
     return response["choices"][0]["message"]["content"]
 
 
+def _dependencies_ready() -> bool:
+    """Return True when at least one OpenAI client implementation is importable."""
+
+    return OpenAI is not None or _legacy_openai is not None
+
+
+def _render_dependency_warning() -> None:
+    """Display a prominent warning in the UI when dependencies are missing."""
+
+    if _dependencies_ready():
+        return
+
+    st.sidebar.error(
+        "La bibliothèque `openai` est absente. Ajoutez-la au fichier ``requirements.txt`` "
+        "ou installez-la dans votre environnement pour utiliser le chatbot."
+    )
+    st.stop()
+
+
 def _initial_messages(system_prompt: str) -> List[Dict[str, str]]:
     """Return the initial conversation scaffold."""
     return [
@@ -86,11 +106,10 @@ def main() -> None:
     st.set_page_config(page_title="La Poste - ChatGPT", page_icon="📮", layout="wide")
     st.title("📮 Assistant conversationnel La Poste")
 
-    default_system_prompt = (
-        "Tu es un assistant virtuel de La Poste. Réponds avec clarté et professionnalisme."
-    )
+    default_system_prompt = "Tu es un assistant virtuel de La Poste. Réponds avec clarté et professionnalisme."
 
     _ensure_session_state(default_system_prompt)
+    _render_dependency_warning()
 
     with st.sidebar:
         st.header("Configuration")
@@ -98,7 +117,7 @@ def main() -> None:
             "Clé API OpenAI",
             value=os.getenv("OPENAI_API_KEY", ""),
             type="password",
-            help="Saisissez votre clé API OpenAI personnelle."
+            help="Saisissez votre clé API OpenAI personnelle.",
         )
 
         model = st.selectbox(
@@ -110,7 +129,7 @@ def main() -> None:
                 "gpt-3.5-turbo",
             ],
             index=0,
-            help="Choisissez le modèle ChatGPT à utiliser."
+            help="Choisissez le modèle ChatGPT à utiliser.",
         )
 
         temperature = st.slider(
