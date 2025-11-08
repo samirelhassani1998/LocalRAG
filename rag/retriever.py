@@ -50,14 +50,40 @@ def _bm25_rerank(query: str, docs: Sequence[Document], k: int) -> List[Document]
     return [doc for doc, _ in ranked[:k]]
 
 
-def retrieve(vectorstore, query: str, k: int = 8, enable_rerank: bool = True) -> List[Document]:
-    """Return the top-k documents for the query, applying reranking when possible."""
+def retrieve(
+    vectorstore,
+    query: str,
+    k: int = 8,
+    *,
+    mode: str = "performance",
+    enable_rerank: bool = True,
+) -> List[Document]:
+    """Return the top-k documents for the query, applying mode-specific logic."""
 
     if vectorstore is None:
         return []
 
+    docs: Sequence[Document] = []
+
+    if mode == "performance":
+        fetch_k = max(24, k * 6)
+        try:
+            docs = vectorstore.max_marginal_relevance_search(
+                query,
+                k=k,
+                fetch_k=fetch_k,
+                lambda_mult=0.5,
+            )
+        except Exception:
+            try:
+                docs = vectorstore.similarity_search(query, k=k)
+            except Exception:
+                docs = []
+        docs = [doc for doc in docs if doc and getattr(doc, "page_content", None)]
+        return list(docs[:k])
+
     fetch_k = max(k * 3, k)
-    docs: Sequence[Document] = vectorstore.similarity_search(query, k=fetch_k) or []
+    docs = vectorstore.similarity_search(query, k=fetch_k) or []
     docs = [doc for doc in docs if doc and getattr(doc, "page_content", None)]
     if not docs:
         return []

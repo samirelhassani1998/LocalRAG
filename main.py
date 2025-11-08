@@ -41,6 +41,15 @@ load_dotenv()
 
 st.set_page_config(page_title="ChatGPT-like Chatbot", layout="wide")
 
+if "mode" not in st.session_state:
+    st.session_state.mode = "performance"
+if "model_default_set" not in st.session_state:
+    st.session_state.model_default_set = False
+if "mode_defaults_applied_for" not in st.session_state:
+    st.session_state.mode_defaults_applied_for = None
+if "ui_mode_selector" not in st.session_state:
+    st.session_state.ui_mode_selector = "Performance"
+
 AVAILABLE_MODELS = [
     "gpt-4o",
     "gpt-4o-mini",
@@ -78,6 +87,11 @@ DEFAULT_TOP_P = 0.95
 DEFAULT_MAX_TOKENS = 2000
 MAX_TOKENS_MIN = 512
 MAX_TOKENS_MAX = 8192
+
+PERFORMANCE_DEFAULT_K = 4
+PERFORMANCE_DEFAULT_MAX_TOKENS = 900
+PERFORMANCE_DEFAULT_TEMPERATURE = 0.6
+PERFORMANCE_DEFAULT_TOP_P = 0.9
 
 
 BASE_GLOBAL_SYSTEM_PROMPT = (
@@ -147,18 +161,6 @@ def _init_session_state() -> None:
         st.session_state.rag_docs = []
     if "rag_embedding_model" not in st.session_state:
         st.session_state.rag_embedding_model = EMBEDDING_MODEL
-    if "rag_retrieval_k" not in st.session_state:
-        st.session_state.rag_retrieval_k = DEFAULT_RETRIEVAL_K
-    if "generation_temperature" not in st.session_state:
-        st.session_state.generation_temperature = DEFAULT_TEMPERATURE
-    if "generation_top_p" not in st.session_state:
-        st.session_state.generation_top_p = DEFAULT_TOP_P
-    if "generation_max_tokens" not in st.session_state:
-        st.session_state.generation_max_tokens = DEFAULT_MAX_TOKENS
-    if "rag_enable_multipass" not in st.session_state:
-        st.session_state.rag_enable_multipass = True
-    if "rag_enable_rerank" not in st.session_state:
-        st.session_state.rag_enable_rerank = TORCH_AVAILABLE
     if "rag_diagnostics" not in st.session_state:
         st.session_state.rag_diagnostics = None
     if "chat_attachments" not in st.session_state:
@@ -189,6 +191,38 @@ def _remove_api_key() -> None:
     _reset_chat()
     _reset_rag_state()
     st.rerun()
+
+
+def set_defaults_if_needed(*, force: bool = False) -> None:
+    perf = st.session_state.mode == "performance"
+
+    if not st.session_state.model_default_set:
+        try:
+            st.session_state.selected_model = "gpt-4o-mini"
+        except Exception:
+            pass
+        st.session_state.model_default_set = True
+
+    def set_value(key: str, val: Any) -> None:
+        if force or key not in st.session_state:
+            st.session_state[key] = val
+
+    if perf:
+        set_value("rag_k", PERFORMANCE_DEFAULT_K)
+        set_value("use_multipass", False)
+        set_value("use_reranker", False)
+        set_value("gen_max_tokens", PERFORMANCE_DEFAULT_MAX_TOKENS)
+        set_value("gen_temperature", PERFORMANCE_DEFAULT_TEMPERATURE)
+        set_value("gen_top_p", PERFORMANCE_DEFAULT_TOP_P)
+    else:
+        set_value("rag_k", DEFAULT_RETRIEVAL_K)
+        set_value("use_multipass", True)
+        set_value("use_reranker", TORCH_AVAILABLE)
+        set_value("gen_max_tokens", DEFAULT_MAX_TOKENS)
+        set_value("gen_temperature", DEFAULT_TEMPERATURE)
+        set_value("gen_top_p", DEFAULT_TOP_P)
+
+    st.session_state.mode_defaults_applied_for = st.session_state.mode
 
 
 def _rag_is_ready() -> bool:
@@ -237,6 +271,18 @@ class SessionVectorStore:
             if len(documents) >= limit:
                 break
         return documents
+
+    def max_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = PERFORMANCE_DEFAULT_K,
+        fetch_k: int = 24,
+        lambda_mult: float = 0.5,
+    ) -> List[Document]:
+        _ = lambda_mult  # unused but kept for signature compatibility
+        limit = max(fetch_k, k)
+        docs = self.similarity_search(query, k=limit)
+        return docs[:k]
 
 
 def _format_sources_line(sources: Sequence[Dict[str, Any]]) -> str:
@@ -491,46 +537,77 @@ def _render_sidebar() -> Dict[str, Any]:
 
         st.markdown("---")
         st.markdown("### Paramètres RAG & génération")
-        st.session_state.rag_retrieval_k = st.slider(
+        current_mode_index = 0 if st.session_state.mode == "performance" else 1
+        mode_choice = st.radio(
+            "🎛️ Mode",
+            ["Performance", "Qualité"],
+            horizontal=True,
+            index=current_mode_index,
+            key="ui_mode_selector",
+        )
+        st.session_state.mode = "performance" if mode_choice == "Performance" else "qualite"
+
+        if st.session_state.get("mode_defaults_applied_for") != st.session_state.mode:
+            set_defaults_if_needed(force=True)
+        else:
+            set_defaults_if_needed()
+
+        st.caption(
+            "⚡ Performance" if st.session_state.mode == "performance" else "🔎 Qualité"
+        )
+
+        st.slider(
             "k (passages)",
             min_value=1,
             max_value=20,
-            value=int(st.session_state.rag_retrieval_k or DEFAULT_RETRIEVAL_K),
+            value=int(st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K)),
+            key="rag_k",
         )
-        st.session_state.generation_temperature = st.slider(
+        st.slider(
             "Température",
             min_value=0.0,
             max_value=1.0,
-            value=float(st.session_state.generation_temperature or DEFAULT_TEMPERATURE),
+            value=float(st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE)),
             step=0.05,
+            key="gen_temperature",
         )
-        st.session_state.generation_top_p = st.slider(
+        st.slider(
             "Top-p",
             min_value=0.1,
             max_value=1.0,
-            value=float(st.session_state.generation_top_p or DEFAULT_TOP_P),
+            value=float(st.session_state.get("gen_top_p", DEFAULT_TOP_P)),
             step=0.01,
+            key="gen_top_p",
         )
-        st.session_state.generation_max_tokens = st.slider(
+        st.slider(
             "Max tokens",
             min_value=MAX_TOKENS_MIN,
             max_value=MAX_TOKENS_MAX,
-            value=int(st.session_state.generation_max_tokens or DEFAULT_MAX_TOKENS),
+            value=int(st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS)),
             step=128,
+            key="gen_max_tokens",
         )
-        st.session_state.rag_enable_multipass = st.checkbox(
+        st.checkbox(
             "Activer multi-pass (2 passes)",
-            value=bool(st.session_state.rag_enable_multipass),
+            value=bool(st.session_state.get("use_multipass", True)),
+            key="use_multipass",
         )
-        rerank_disabled = not TORCH_AVAILABLE
-        rerank_value = st.checkbox(
+        rerank_disabled = (st.session_state.mode == "performance") or (not TORCH_AVAILABLE)
+        st.checkbox(
             "Activer reranking Cross-Encoder",
-            value=bool(st.session_state.rag_enable_rerank and not rerank_disabled),
+            value=bool(st.session_state.get("use_reranker", False) and TORCH_AVAILABLE),
+            key="use_reranker",
             disabled=rerank_disabled,
         )
-        st.session_state.rag_enable_rerank = bool(rerank_value and not rerank_disabled)
         if rerank_disabled:
-            st.caption("Cross-Encoder indisponible (torch manquant ou non pris en charge).")
+            st.session_state.use_reranker = False
+            if not TORCH_AVAILABLE:
+                st.caption("Cross-Encoder indisponible (torch manquant ou non pris en charge).")
+
+        if st.session_state.mode == "performance":
+            st.caption(
+                "Optimisations actives : k=4, MMR, pas de multi-pass, pas de reranking, max_tokens=900"
+            )
 
         with st.expander("Diagnostics", expanded=False):
             diag = st.session_state.get("rag_diagnostics") or {}
@@ -539,9 +616,12 @@ def _render_sidebar() -> Dict[str, Any]:
             else:
                 lines = [
                     f"- Modèle : {diag.get('model', '-')}",
+                    f"- Mode : {diag.get('mode', '-')}",
                     f"- k : {diag.get('k', '-')}",
                     f"- Temps retrieval : {diag.get('retrieval_time_s', '-')} s",
                 ]
+                if diag.get("rerank_used") is not None:
+                    lines.append(f"- Reranker : {'oui' if diag.get('rerank_used') else 'non'}")
                 if diag.get("pass1_time_s") is not None:
                     lines.append(f"- Pass 1 : {diag['pass1_time_s']} s")
                 if diag.get("pass2_time_s") is not None:
@@ -572,6 +652,8 @@ def _render_sidebar() -> Dict[str, Any]:
             else:
                 lines: List[str] = []
                 lines.append(f"- **Modèle :** {log.get('model', '-')}")
+                if log.get("mode"):
+                    lines.append(f"- **Mode :** {log.get('mode')}")
                 lines.append(f"- **Type d’appel :** {log.get('call_type', '-')}")
                 lines.append(
                     f"- **Messages envoyés :** {log.get('messages_count', 0)}"
@@ -1093,7 +1175,7 @@ def _render_chat_interface() -> None:
     st.markdown("<div class='chat-header'>ChatGPT-like Chatbot</div>", unsafe_allow_html=True)
 
     if _rag_is_ready():
-        st.markdown(f"🧠 RAG actif (k={st.session_state.rag_retrieval_k})")
+        st.markdown(f"🧠 RAG actif (k={st.session_state.get('rag_k', PERFORMANCE_DEFAULT_K)})")
 
     for message in st.session_state.messages:
         if message["role"] == "system":
@@ -1385,16 +1467,17 @@ def _render_chat_interface() -> None:
                     vectorstore,
                     query_for_rag,
                     st.session_state.messages,
-                    k=int(st.session_state.rag_retrieval_k or DEFAULT_RETRIEVAL_K),
+                    k=int(st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K)),
                     temperature=float(
-                        st.session_state.generation_temperature or DEFAULT_TEMPERATURE
+                        st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE)
                     ),
-                    top_p=float(st.session_state.generation_top_p or DEFAULT_TOP_P),
+                    top_p=float(st.session_state.get("gen_top_p", DEFAULT_TOP_P)),
                     max_tokens=int(
-                        st.session_state.generation_max_tokens or DEFAULT_MAX_TOKENS
+                        st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS)
                     ),
-                    enable_multipass=bool(st.session_state.rag_enable_multipass),
-                    enable_rerank=bool(st.session_state.rag_enable_rerank),
+                    enable_multipass=bool(st.session_state.get("use_multipass", True)),
+                    enable_rerank=bool(st.session_state.get("use_reranker", False)),
+                    mode=st.session_state.mode,
                 )
                 st.session_state.rag_diagnostics = pipeline_result.get("diagnostics")
             except Exception as error:  # noqa: BLE001 - fallback to classic path
@@ -1463,12 +1546,13 @@ def _render_chat_interface() -> None:
                 "response_chars": len(final_text or ""),
                 "status": "success",
                 "pipeline_diagnostics": pipeline_result.get("diagnostics"),
-                "temperature": st.session_state.generation_temperature,
-                "top_p": st.session_state.generation_top_p,
-                "max_tokens": st.session_state.generation_max_tokens,
-                "rag_k": st.session_state.rag_retrieval_k,
-                "multipass": st.session_state.rag_enable_multipass,
-                "rerank": st.session_state.rag_enable_rerank,
+                "temperature": st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE),
+                "top_p": st.session_state.get("gen_top_p", DEFAULT_TOP_P),
+                "max_tokens": st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS),
+                "rag_k": st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K),
+                "multipass": st.session_state.get("use_multipass", True),
+                "rerank": st.session_state.get("use_reranker", False),
+                "mode": st.session_state.mode,
             }
             st.session_state.last_call_log = call_context
             return
@@ -1493,7 +1577,7 @@ def _render_chat_interface() -> None:
                     st.session_state.rag_texts,
                     st.session_state.rag_meta,
                     st.session_state.rag_embedding_model or EMBEDDING_MODEL,
-                    k=int(st.session_state.rag_retrieval_k or DEFAULT_RETRIEVAL_K),
+                    k=int(st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K)),
                 )
             except Exception as error:  # noqa: BLE001 - surface gracefully
                 st.warning(f"Recherche contextuelle indisponible : {error}")
@@ -1553,12 +1637,13 @@ def _render_chat_interface() -> None:
             "rag_hits": len(hits),
             "sources_count": len(sources_info),
             "usage": None,
-            "temperature": st.session_state.generation_temperature,
-            "top_p": st.session_state.generation_top_p,
-            "max_tokens": st.session_state.generation_max_tokens,
-            "rag_k": st.session_state.rag_retrieval_k,
-            "multipass": st.session_state.rag_enable_multipass,
-            "rerank": st.session_state.rag_enable_rerank,
+            "temperature": st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE),
+            "top_p": st.session_state.get("gen_top_p", DEFAULT_TOP_P),
+            "max_tokens": st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS),
+            "rag_k": st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K),
+            "multipass": st.session_state.get("use_multipass", True),
+            "rerank": st.session_state.get("use_reranker", False),
+            "mode": st.session_state.mode,
             "pipeline_diagnostics": st.session_state.get("rag_diagnostics"),
         }
 
@@ -1715,6 +1800,7 @@ def _render_chat_interface() -> None:
 
 if __name__ == "__main__":
     _init_session_state()
+    set_defaults_if_needed()
 
     if not st.session_state.api_key:
         _render_key_gate()
