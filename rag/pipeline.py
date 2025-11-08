@@ -73,10 +73,11 @@ def run_rag_pipeline(
     max_tokens: int = 2000,
     enable_multipass: bool = True,
     enable_rerank: bool = True,
+    mode: str = "performance",
 ) -> Dict[str, Any]:
     """Execute the enhanced multi-pass RAG workflow and return structured data."""
 
-    diagnostics: Dict[str, Any] = {"model": model, "k": k}
+    diagnostics: Dict[str, Any] = {"model": model, "k": k, "mode": mode}
 
     history_start = time.perf_counter()
     history_summary = summarize_history(client, model, messages)
@@ -84,9 +85,11 @@ def run_rag_pipeline(
     diagnostics["history_chars"] = len(history_summary)
 
     retrieval_start = time.perf_counter()
-    docs = retrieve(vectorstore, query, k=k, enable_rerank=enable_rerank)
+    effective_rerank = enable_rerank and mode != "performance"
+    docs = retrieve(vectorstore, query, k=k, mode=mode, enable_rerank=effective_rerank)
     diagnostics["retrieval_time_s"] = round(time.perf_counter() - retrieval_start, 3)
     diagnostics["retrieved_docs"] = len(docs)
+    diagnostics["rerank_used"] = bool(effective_rerank)
 
     context, sources = build_context(docs)
 
