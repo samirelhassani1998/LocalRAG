@@ -14,9 +14,10 @@ import numpy as np
 import pandas as pd
 from openai import OpenAI
 
-import chardet
 import streamlit as st
 from token_utils import count_tokens_text, truncate_context_text
+from charset_normalizer import from_bytes
+from utils.text_normalize import ensure_text, ensure_text_iter
 
 try:  # pragma: no cover - handled gracefully at runtime
     import faiss
@@ -100,7 +101,14 @@ def read_csv_streamed(file_bytes: bytes, max_rows: int | None = None, sep: str =
     char_total = 0
     encoding = _detect_encoding(file_bytes)
     try:
-        reader = pd.read_csv(bio, chunksize=CSV_CHUNKSIZE_ROWS, sep=sep, encoding=encoding)
+        reader = pd.read_csv(
+            bio,
+            chunksize=CSV_CHUNKSIZE_ROWS,
+            sep=sep,
+            encoding=encoding,
+            engine="python",
+            on_bad_lines="skip",
+        )
     except UnicodeDecodeError:
         bio = BytesIO(file_bytes)
         reader = pd.read_csv(
@@ -109,9 +117,11 @@ def read_csv_streamed(file_bytes: bytes, max_rows: int | None = None, sep: str =
             sep=sep,
             encoding="utf-8",
             encoding_errors="ignore",
+            engine="python",
+            on_bad_lines="skip",
         )
     for chunk in reader:
-        chunk_csv = chunk.to_csv(index=False)
+        chunk_csv = ensure_text(chunk.to_csv(index=False))
         texts.append(chunk_csv)
         char_total += len(chunk_csv)
         rows += len(chunk)
@@ -119,7 +129,7 @@ def read_csv_streamed(file_bytes: bytes, max_rows: int | None = None, sep: str =
             break
         if char_total >= MAX_TOTAL_CHARS:
             break
-    return "\n".join(texts)
+    return ensure_text("\n".join(texts))
 
 
 def read_excel_streamed(file_bytes: bytes) -> str:
@@ -130,12 +140,13 @@ def read_excel_streamed(file_bytes: bytes) -> str:
     for i, (name, df) in enumerate(sheets.items()):
         if i >= EXCEL_MAX_SHEETS:
             break
-        text = df.to_csv(index=False)
-        texts.append(f"### Sheet: {name}\n{text}")
+        sheet_name = ensure_text(name)
+        text = ensure_text(df.to_csv(index=False))
+        texts.append(ensure_text(f"### Sheet: {sheet_name}\n{text}"))
         char_total += len(texts[-1])
         if char_total >= MAX_TOTAL_CHARS:
             break
-    return "\n\n".join(texts)
+    return ensure_text("\n\n".join(texts))
 
 
 def read_pdf_paged(file_bytes: bytes) -> List[Tuple[str, Dict[str, Any]]]:
@@ -147,7 +158,7 @@ def read_pdf_paged(file_bytes: bytes) -> List[Tuple[str, Dict[str, Any]]]:
     for i, page in enumerate(reader.pages):
         if i >= PDF_MAX_PAGES:
             break
-        txt = page.extract_text() or ""
+        txt = ensure_text(page.extract_text() or "")
         if not txt.strip():
             continue  # page vide / scannée
         pages.append((txt, {"page": i + 1}))
@@ -246,17 +257,14 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _detect_encoding(data: bytes) -> str:
-    guess = chardet.detect(data)
-    encoding = guess.get("encoding") or "utf-8"
-    return encoding
+    match = from_bytes(data).best()
+    if match is None or not match.encoding:
+        return "utf-8"
+    return match.encoding
 
 
 def _bytes_to_text(data: bytes) -> str:
-    encoding = _detect_encoding(data)
-    try:
-        return data.decode(encoding)
-    except (LookupError, UnicodeDecodeError):
-        return data.decode("utf-8", errors="ignore")
+    return ensure_text(data)
 
 
 def _json_scalar_to_str(value: Any) -> str:
@@ -340,13 +348,13 @@ def _json_structure_to_text(
 def parse_json_bytes(data: bytes) -> str:
     """Parse JSON or NDJSON content fully in memory and return text."""
 
-    decoded = data.decode("utf-8", "ignore")
+    decoded = ensure_text(data)
     try:
         parsed = json.loads(decoded)
     except json.JSONDecodeError as exc:
         records: List[Any] = []
         for raw_line in decoded.splitlines():
-            line = raw_line.strip()
+            line = ensure_text(raw_line).strip()
             if not line:
                 continue
             try:
@@ -359,7 +367,7 @@ def parse_json_bytes(data: bytes) -> str:
     else:
         text = _json_structure_to_text(parsed)
 
-    text = text.strip()
+    text = ensure_text(text).strip()
     if len(text) > MAX_TOTAL_CHARS:
         return text[:MAX_TOTAL_CHARS]
     return text
@@ -380,7 +388,7 @@ def parse_json_streaming(data: bytes) -> Iterator[str]:
         nonlocal buffer, buffer_len, total_chars
         if not buffer:
             return None
-        chunk = "\n\n".join(buffer).strip()
+        chunk = ensure_text("\n\n".join(buffer)).strip()
         buffer = []
         buffer_len = 0
         if not chunk:
@@ -395,7 +403,7 @@ def parse_json_streaming(data: bytes) -> Iterator[str]:
 
     def append_text(text: str) -> Optional[str]:
         nonlocal buffer_len
-        stripped = text.strip()
+        stripped = ensure_text(text).strip()
         if not stripped:
             return None
         if len(stripped) > MAX_TOTAL_CHARS:
@@ -438,7 +446,7 @@ def parse_json_streaming(data: bytes) -> Iterator[str]:
         for line_no, raw_line in enumerate(bio, start=1):
             if total_chars >= MAX_TOTAL_CHARS:
                 break
-            line = raw_line.decode("utf-8", "ignore").strip()
+            line = ensure_text(raw_line).strip()
             if not line:
                 continue
             try:
@@ -480,15 +488,19 @@ def _ingest_text_document(
     max_chars: int,
     overlap: int,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
+    safe_name = ensure_text(name)
     text_content = _bytes_to_text(data)
     if len(text_content) > MAX_TOTAL_CHARS:
         text_content = text_content[:MAX_TOTAL_CHARS]
     chunks = [
-        DocumentChunk(text=chunk, meta={"source": name, "type": file_type})
+        DocumentChunk(
+            text=ensure_text(chunk),
+            meta={"source": safe_name, "type": file_type},
+        )
         for chunk in chunk_text(text_content, max_chars=max_chars, overlap=overlap)
     ]
     summary = {
-        "name": name,
+        "name": safe_name,
         "type": file_type,
         "size_bytes": len(data),
         "chunk_count": len(chunks),
@@ -505,6 +517,7 @@ def _ingest_csv(
     overlap: int,
     stream: bool = False,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
+    safe_name = ensure_text(name)
     warnings: List[str] = []
     lower_name = name.lower()
     sep = "\t" if lower_name.endswith(".tsv") else ","
@@ -513,21 +526,29 @@ def _ingest_csv(
     else:
         encoding = _detect_encoding(data)
         try:
-            df = pd.read_csv(io.BytesIO(data), encoding=encoding, sep=sep)
+            df = pd.read_csv(
+                io.BytesIO(data),
+                encoding=encoding,
+                sep=sep,
+                engine="python",
+                on_bad_lines="skip",
+            )
         except UnicodeDecodeError:
             df = pd.read_csv(
                 io.BytesIO(data),
                 encoding="utf-8",
                 encoding_errors="ignore",
                 sep=sep,
+                engine="python",
+                on_bad_lines="skip",
             )
         except Exception as exc:
-            return [], {}, [f"Erreur lors de la lecture CSV {name}: {exc}"]
+            return [], {}, [f"Erreur lors de la lecture CSV {safe_name}: {exc}"]
 
         if df.empty:
-            warnings.append(f"Le fichier CSV {name} est vide.")
+            warnings.append(f"Le fichier CSV {safe_name} est vide.")
             summary = {
-                "name": name,
+                "name": safe_name,
                 "type": "csv",
                 "size_bytes": len(data),
                 "chunk_count": 0,
@@ -535,20 +556,22 @@ def _ingest_csv(
             }
             return [], summary, warnings
 
-        csv_text = df.to_csv(index=False)
+        csv_text = ensure_text(df.to_csv(index=False))
         if len(csv_text) > MAX_TOTAL_CHARS:
             csv_text = csv_text[:MAX_TOTAL_CHARS]
 
+    csv_text = ensure_text(csv_text)
+
     chunks = [
         DocumentChunk(
-            text=chunk,
-            meta={"source": name, "type": "csv"},
+            text=ensure_text(chunk),
+            meta={"source": safe_name, "type": "csv"},
         )
         for chunk in chunk_text(csv_text, max_chars=max_chars, overlap=overlap)
     ]
 
     summary = {
-        "name": name,
+        "name": safe_name,
         "type": "csv",
         "size_bytes": len(data),
         "chunk_count": len(chunks),
@@ -565,37 +588,45 @@ def _ingest_excel(
     overlap: int,
     stream: bool = False,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
+    safe_name = ensure_text(name)
     warnings: List[str] = []
     if stream:
         excel_text = read_excel_streamed(data)
         chunks = [
-            DocumentChunk(text=chunk, meta={"source": name, "type": "excel"})
+            DocumentChunk(text=ensure_text(chunk), meta={"source": safe_name, "type": "excel"})
             for chunk in chunk_text(excel_text, max_chars=max_chars, overlap=overlap)
         ]
     else:
         try:
             sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
         except Exception as exc:
-            return [], {}, [f"Erreur lors de la lecture Excel {name}: {exc}"]
+            return [], {}, [f"Erreur lors de la lecture Excel {safe_name}: {exc}"]
 
         chunks = []
         for sheet_name, df in sheets.items():
             if df.empty:
-                warnings.append(f"La feuille '{sheet_name}' dans {name} est vide.")
+                warnings.append(
+                    f"La feuille '{ensure_text(sheet_name)}' dans {safe_name} est vide."
+                )
                 continue
-            text = df.to_csv(index=False)
+            safe_sheet_name = ensure_text(sheet_name)
+            text = ensure_text(df.to_csv(index=False))
             if len(text) > MAX_TOTAL_CHARS:
                 text = text[:MAX_TOTAL_CHARS]
             for part in chunk_text(text, max_chars=max_chars, overlap=overlap):
                 chunks.append(
                     DocumentChunk(
-                        text=part,
-                        meta={"source": name, "type": "excel", "sheet": sheet_name},
+                        text=ensure_text(part),
+                        meta={
+                            "source": safe_name,
+                            "type": "excel",
+                            "sheet": safe_sheet_name,
+                        },
                     )
                 )
 
     summary = {
-        "name": name,
+        "name": safe_name,
         "type": "excel",
         "size_bytes": len(data),
         "chunk_count": len(chunks),
@@ -612,6 +643,7 @@ def _ingest_pdf(
     overlap: int,
     stream: bool = False,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
+    safe_name = ensure_text(name)
     chunks: List[DocumentChunk] = []
     warnings: List[str] = []
 
@@ -621,8 +653,8 @@ def _ingest_pdf(
             if not cleaned:
                 continue
             for chunk in chunk_text(cleaned, max_chars=max_chars, overlap=overlap):
-                chunk_meta = {"source": name, "type": "pdf", **meta}
-                chunks.append(DocumentChunk(text=chunk, meta=chunk_meta))
+                chunk_meta = {"source": safe_name, "type": "pdf", **meta}
+                chunks.append(DocumentChunk(text=ensure_text(chunk), meta=chunk_meta))
     else:
         pdf_reader = PdfReader(io.BytesIO(data))
         total_chars = 0
@@ -630,13 +662,15 @@ def _ingest_pdf(
             if total_chars >= MAX_TOTAL_CHARS:
                 break
             try:
-                text = page.extract_text() or ""
+                text = ensure_text(page.extract_text() or "")
             except Exception as exc:
-                warnings.append(f"Extraction impossible page {page_number} ({name}) : {exc}")
+                warnings.append(f"Extraction impossible page {page_number} ({safe_name}) : {exc}")
                 continue
             cleaned = _clean_text(text)
             if not cleaned:
-                warnings.append(f"Page {page_number} du PDF {name} semble ne contenir aucun texte.")
+                warnings.append(
+                    f"Page {page_number} du PDF {safe_name} semble ne contenir aucun texte."
+                )
                 continue
             remaining = MAX_TOTAL_CHARS - total_chars
             truncated = cleaned[:remaining]
@@ -644,15 +678,15 @@ def _ingest_pdf(
             for chunk in chunk_text(truncated, max_chars=max_chars, overlap=overlap):
                 chunks.append(
                     DocumentChunk(
-                        text=chunk,
-                        meta={"source": name, "type": "pdf", "page": page_number},
+                        text=ensure_text(chunk),
+                        meta={"source": safe_name, "type": "pdf", "page": page_number},
                     )
                 )
             if total_chars >= MAX_TOTAL_CHARS:
                 break
 
     summary = {
-        "name": name,
+        "name": safe_name,
         "type": "pdf",
         "size_bytes": len(data),
         "chunk_count": len(chunks),
@@ -671,21 +705,22 @@ def _ingest_docx(
     if Document is None:
         return [], {}, [f"Le support DOCX est indisponible : {DOCX_IMPORT_ERROR}"]
 
+    safe_name = ensure_text(name)
     try:
         document = Document(io.BytesIO(data))
     except Exception as exc:
-        return [], {}, [f"Erreur lors de la lecture DOCX {name}: {exc}"]
+        return [], {}, [f"Erreur lors de la lecture DOCX {safe_name}: {exc}"]
 
-    paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
-    full_text = "\n".join(paragraphs)
+    paragraphs = [ensure_text(p.text) for p in document.paragraphs if p.text.strip()]
+    full_text = ensure_text("\n".join(paragraphs))
     if len(full_text) > MAX_TOTAL_CHARS:
         full_text = full_text[:MAX_TOTAL_CHARS]
     chunks = [
-        DocumentChunk(text=chunk, meta={"source": name, "type": "docx"})
+        DocumentChunk(text=ensure_text(chunk), meta={"source": safe_name, "type": "docx"})
         for chunk in chunk_text(full_text, max_chars=max_chars, overlap=overlap)
     ]
     summary = {
-        "name": name,
+        "name": safe_name,
         "type": "docx",
         "size_bytes": len(data),
         "chunk_count": len(chunks),
@@ -703,6 +738,7 @@ def _ingest_json(
     overlap: int,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
     stream_mode = should_stream_file(size_bytes)
+    safe_name = ensure_text(name)
     try:
         blocks: Iterable[str]
         if stream_mode:
@@ -710,7 +746,7 @@ def _ingest_json(
         else:
             blocks = [parse_json_bytes(data)]
     except ValueError as exc:
-        return [], {}, [f"Erreur lors de la lecture JSON {name}: {exc}"]
+        return [], {}, [f"Erreur lors de la lecture JSON {safe_name}: {exc}"]
 
     chunks: List[DocumentChunk] = []
     token_estimate = 0
@@ -718,18 +754,20 @@ def _ingest_json(
         if not block:
             continue
         for chunk in chunk_text(block, max_chars=max_chars, overlap=overlap):
-            meta: Dict[str, Any] = {"source": name, "type": "json"}
+            meta: Dict[str, Any] = {"source": safe_name, "type": "json"}
             if stream_mode:
                 meta["segment"] = block_index
-            chunks.append(DocumentChunk(text=chunk, meta=meta))
+            chunks.append(DocumentChunk(text=ensure_text(chunk), meta=meta))
             token_estimate += _estimate_tokens(chunk)
 
     warnings: List[str] = []
     if not chunks:
-        warnings.append(f"Le fichier JSON {name} ne contient pas de contenu exploitable.")
+        warnings.append(
+            f"Le fichier JSON {safe_name} ne contient pas de contenu exploitable."
+        )
 
     summary = {
-        "name": name,
+        "name": safe_name,
         "type": "json",
         "size_bytes": size_bytes,
         "chunk_count": len(chunks),
@@ -740,9 +778,10 @@ def _ingest_json(
 
 def load_file_to_chunks(uploaded_file, max_chars: int = 4000, overlap: int = 400) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
     name = uploaded_file.name
+    safe_name = ensure_text(name)
     extension = name.split(".")[-1].lower()
     if extension not in SUPPORTED_EXTENSIONS:
-        return [], {}, [f"Format non supporté : {name}"]
+        return [], {}, [f"Format non supporté : {safe_name}"]
 
     size = getattr(uploaded_file, "size", None)
     data = uploaded_file.getvalue()
@@ -751,7 +790,9 @@ def load_file_to_chunks(uploaded_file, max_chars: int = 4000, overlap: int = 400
 
     if size > CHAT_MAX_FILE_SIZE and not ALLOW_LARGE_FILES:
         limit_mb = DEFAULT_MAX_FILE_MB
-        return [], {}, [f"{name} ({format_bytes(size)}) dépasse {limit_mb} Mo et a été ignoré."]
+        return [], {}, [
+            f"{safe_name} ({format_bytes(size)}) dépasse {limit_mb} Mo et a été ignoré."
+        ]
 
     stream_mode = should_stream_file(size)
 
@@ -774,7 +815,7 @@ def load_file_to_chunks(uploaded_file, max_chars: int = 4000, overlap: int = 400
             overlap=overlap,
         )
 
-    return [], {}, [f"Extension inconnue : {name}"]
+    return [], {}, [f"Extension inconnue : {safe_name}"]
 
 
 class _InMemoryUploadedFile:
@@ -850,6 +891,7 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
 
     for name, data, size in normalised:
         extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        safe_name = ensure_text(name)
 
         if extension == "json":
             stream_mode = should_stream_file(size)
@@ -859,11 +901,13 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
                 else:
                     blocks = [parse_json_bytes(data)]
             except ValueError as exc:
-                warn_msg = f"Impossible d'indexer {name} ({format_bytes(size)}): {exc}"
+                warn_msg = (
+                    f"Impossible d'indexer {safe_name} ({format_bytes(size)}): {exc}"
+                )
                 st.warning(warn_msg)
                 warnings.append(warn_msg)
                 if _STATUS_WRITE_CALLBACK:
-                    _STATUS_WRITE_CALLBACK(f"❌ {name} : {exc}")
+                    _STATUS_WRITE_CALLBACK(f"❌ {safe_name} : {exc}")
                 continue
 
             chunk_count = 0
@@ -872,23 +916,23 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
                 if not block:
                     continue
                 for chunk in chunk_text(block):
-                    meta: Dict[str, Any] = {"source": name, "type": "json"}
+                    meta: Dict[str, Any] = {"source": safe_name, "type": "json"}
                     if stream_mode:
                         meta["segment"] = block_index
-                    chunk_texts.append(chunk)
+                    chunk_texts.append(ensure_text(chunk))
                     chunk_metas.append(meta)
                     chunk_count += 1
                     token_estimate += _estimate_tokens(chunk)
 
             if chunk_count == 0:
-                msg = f"⚠️ {name} — aucun contenu JSON exploitable."
+                msg = f"⚠️ {safe_name} — aucun contenu JSON exploitable."
                 warnings.append(msg)
                 if _STATUS_WRITE_CALLBACK:
                     _STATUS_WRITE_CALLBACK(msg)
                 continue
 
             summary = {
-                "name": name,
+                "name": safe_name,
                 "type": "json",
                 "size_bytes": size,
                 "chunk_count": chunk_count,
@@ -896,18 +940,18 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
             }
             doc_summaries.append(summary)
             if _STATUS_WRITE_CALLBACK:
-                _STATUS_WRITE_CALLBACK(f"✔️ {name} — {chunk_count} chunks")
+                _STATUS_WRITE_CALLBACK(f"✔️ {safe_name} — {chunk_count} chunks")
             continue
 
         in_memory = _InMemoryUploadedFile(name, data)
         try:
             chunks, summary, chunk_warnings = load_file_to_chunks(in_memory)
         except Exception as exc:  # noqa: BLE001 - feedback in UI
-            warn_msg = f"Impossible d'indexer {name} ({format_bytes(size)}): {exc}"
+            warn_msg = f"Impossible d'indexer {safe_name} ({format_bytes(size)}): {exc}"
             st.warning(warn_msg)
             warnings.append(warn_msg)
             if _STATUS_WRITE_CALLBACK:
-                _STATUS_WRITE_CALLBACK(f"❌ {name} : {exc}")
+                _STATUS_WRITE_CALLBACK(f"❌ {safe_name} : {exc}")
             continue
 
         if summary:
@@ -919,17 +963,17 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
                     _STATUS_WRITE_CALLBACK(f"⚠️ {warn}")
         if not chunks:
             if not chunk_warnings:
-                msg = f"⚠️ {name} — aucun texte exploitable."
+                msg = f"⚠️ {safe_name} — aucun texte exploitable."
                 warnings.append(msg)
                 if _STATUS_WRITE_CALLBACK:
                     _STATUS_WRITE_CALLBACK(msg)
             continue
 
         for chunk in chunks:
-            chunk_texts.append(chunk.text)
+            chunk_texts.append(ensure_text(chunk.text))
             chunk_metas.append(chunk.meta)
         if _STATUS_WRITE_CALLBACK:
-            _STATUS_WRITE_CALLBACK(f"✔️ {name} — {len(chunks)} chunks")
+            _STATUS_WRITE_CALLBACK(f"✔️ {safe_name} — {len(chunks)} chunks")
 
     if not chunk_texts:
         return {"documents": 0, "chunks": 0, "warnings": warnings}
@@ -1006,15 +1050,19 @@ def batch_by_token_budget(texts: Sequence[str], model: str, max_tokens: int):
 
 
 def embed_texts(client: OpenAI, model: str, texts: Sequence[str]) -> np.ndarray:
-    if not texts:
+    safe_texts = ensure_text_iter(texts)
+    if not safe_texts:
         return np.empty((0, 0), dtype=np.float32)
 
     vectors: List[List[float]] = []
     truncated_any = False
 
-    for batch in batch_by_token_budget(texts, model, EMBED_MAX_TOKENS_PER_REQUEST):
+    for batch in batch_by_token_budget(safe_texts, model, EMBED_MAX_TOKENS_PER_REQUEST):
         truncated_any = truncated_any or getattr(batch, "truncated", False)
-        response = client.embeddings.create(model=model, input=list(batch))
+        safe_batch = ensure_text_iter(batch)
+        if not safe_batch:
+            continue
+        response = client.embeddings.create(model=model, input=list(safe_batch))
         vectors.extend(item.embedding for item in response.data)
 
     if truncated_any:
