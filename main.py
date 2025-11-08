@@ -774,7 +774,7 @@ def render_answer_markdown_or_code(
         with c3:
             if (lang or "").lower() == "dbml":
                 url = "https://dbdiagram.io/d/new?code=" + _url.quote(code)
-                st.link_button("↗️ Ouvrir sur dbdiagram.io", url, key=f"{key_root}-dbdiagram")
+                st.link_button("↗️ Ouvrir sur dbdiagram.io", url)
     else:
         st.markdown(raw_text)
 
