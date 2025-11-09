@@ -27,7 +27,6 @@ from rag_utils import (
     human_readable_size,
     index_files_from_chat,
     load_file_to_chunks,
-    retrieve,
 )
 from token_utils import (
     count_tokens_chat,
@@ -101,6 +100,10 @@ MAX_FILE_BYTES = DEFAULT_MAX_FILE_MB * 1024 * 1024
 CHUNK_MAX_CHARS = 4000
 CHUNK_OVERLAP = 400
 MAX_IMAGE_ATTACHMENTS = 5
+
+SIDEBAR_UPLOAD_KEY = "sidebar_uploaded_files"
+CHAT_FILE_UPLOAD_KEY = "chat_file_uploader"
+CHAT_IMAGE_UPLOAD_KEY = "chat_image_uploader"
 
 
 try:  # pragma: no cover - optional dependency check
@@ -205,33 +208,29 @@ def is_org_verify_stream_error(e: Exception) -> bool:
 
 
 def _init_session_state() -> None:
-    if "api_key" not in st.session_state:
-        env_key = os.getenv("OPENAI_API_KEY")
-        st.session_state.api_key = env_key if env_key else None
-    if "messages" not in st.session_state:
-        st.session_state.messages = [dict(GLOBAL_SYSTEM_MESSAGE)]
-    if "selected_model" not in st.session_state:
-        st.session_state.selected_model = CFG.default_model
-    if "rag_index" not in st.session_state:
-        st.session_state.rag_index = None
-    if "rag_texts" not in st.session_state:
-        st.session_state.rag_texts = []
-    if "rag_meta" not in st.session_state:
-        st.session_state.rag_meta = []
-    if "rag_docs" not in st.session_state:
-        st.session_state.rag_docs = []
-    if "rag_embedding_model" not in st.session_state:
-        st.session_state.rag_embedding_model = EMBEDDING_MODEL
-    if "rag_diagnostics" not in st.session_state:
-        st.session_state.rag_diagnostics = None
-    if "chat_attachments" not in st.session_state:
-        st.session_state.chat_attachments = []
-    if "chat_images" not in st.session_state:
-        st.session_state.chat_images = []
-    if "show_logs" not in st.session_state:
-        st.session_state.show_logs = False
-    if "last_call_log" not in st.session_state:
-        st.session_state.last_call_log = None
+    env_key = os.getenv("OPENAI_API_KEY")
+    st.session_state.setdefault("api_key", env_key if env_key else None)
+    st.session_state.setdefault("messages", [dict(GLOBAL_SYSTEM_MESSAGE)])
+    st.session_state.setdefault("selected_model", CFG.default_model)
+    st.session_state.setdefault("rag_index", None)
+    st.session_state.setdefault("rag_texts", [])
+    st.session_state.setdefault("rag_meta", [])
+    st.session_state.setdefault("rag_docs", [])
+    st.session_state.setdefault("rag_embedding_model", EMBEDDING_MODEL)
+    st.session_state.setdefault("rag_diagnostics", None)
+    st.session_state.setdefault("chat_attachments", [])
+    st.session_state.setdefault("chat_images", [])
+    st.session_state.setdefault("show_logs", False)
+    st.session_state.setdefault("last_call_log", None)
+    st.session_state.setdefault("_sidebar_feedback", None)
+    st.session_state.setdefault("_chat_file_warning", [])
+    st.session_state.setdefault("_chat_image_warning", [])
+    st.session_state.setdefault("_pending_rag_reset", False)
+    st.session_state.setdefault("_pending_rag_index", False)
+    st.session_state.setdefault("_pending_chat_submit", None)
+    st.session_state.setdefault(SIDEBAR_UPLOAD_KEY, [])
+    st.session_state.setdefault(CHAT_FILE_UPLOAD_KEY, [])
+    st.session_state.setdefault(CHAT_IMAGE_UPLOAD_KEY, [])
 
 
 def _reset_chat() -> None:
@@ -252,6 +251,36 @@ def _remove_api_key() -> None:
     _reset_chat()
     _reset_rag_state()
     st.rerun()
+
+
+def _request_rag_reset() -> None:
+    st.session_state["_pending_rag_reset"] = True
+    st.rerun()
+
+
+def _request_indexing() -> None:
+    st.session_state["_pending_rag_index"] = True
+    st.rerun()
+
+
+def _process_pending_actions() -> None:
+    feedback: Optional[tuple[str, str]] = None
+
+    st.session_state["_sidebar_feedback"] = None
+
+    if st.session_state.pop("_pending_rag_reset", False):
+        _reset_rag_state()
+        feedback = ("success", "Base documentaire réinitialisée.")
+
+    if st.session_state.pop("_pending_rag_index", False):
+        files = st.session_state.get(SIDEBAR_UPLOAD_KEY) or []
+        if files:
+            _handle_indexing(files)
+        else:
+            feedback = ("warning", "Aucun fichier sélectionné pour l'indexation.")
+
+    if feedback is not None:
+        st.session_state["_sidebar_feedback"] = feedback
 
 
 def set_defaults_if_needed(*, force: bool = False) -> None:
@@ -332,6 +361,24 @@ def _build_source_entries(hits: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]
         _, meta, score = hit
         entries.append({"index": idx, "meta": meta, "score": score})
     return entries
+
+
+def _session_retrieve(vectorstore: SessionVectorStore, query: str, *, k: Optional[int] = None) -> List[Document]:
+    state = st.session_state
+    top_k = int(k or state.get("rag_k", PERFORMANCE_DEFAULT_K))
+    if state.get("use_mmr", True):
+        fetch_k = max(int(state.get("mmr_fetch_k", 24)), top_k * 6)
+        lambda_mult = float(state.get("mmr_lambda", 0.5))
+        try:
+            return vectorstore.max_marginal_relevance_search(
+                query,
+                k=top_k,
+                fetch_k=fetch_k,
+                lambda_mult=lambda_mult,
+            )
+        except Exception:
+            pass
+    return vectorstore.similarity_search(query, k=top_k)
 
 
 def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
@@ -443,6 +490,77 @@ def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
         st.warning(warn)
 
 
+def _add_chat_attachments() -> None:
+    files = st.session_state.get(CHAT_FILE_UPLOAD_KEY) or []
+    attachments = list(st.session_state.get("chat_attachments", []))
+    existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in attachments}
+    warnings: List[str] = []
+
+    for upload in files:
+        key = (getattr(upload, "name", None), getattr(upload, "size", None))
+        if key in existing:
+            continue
+        if len(attachments) >= MAX_FILES:
+            warnings.append(f"Maximum {MAX_FILES} fichiers par envoi.")
+            break
+        size = getattr(upload, "size", None)
+        if size is None:
+            try:
+                size = len(upload.getvalue())
+            except Exception:
+                size = 0
+        if not ALLOW_LARGE_FILES and size and size > MAX_FILE_BYTES:
+            warnings.append(
+                f"{getattr(upload, 'name', 'Fichier')} dépasse la limite de {DEFAULT_MAX_FILE_MB} Mo et a été ignoré."
+            )
+            continue
+        attachments.append(upload)
+        existing.add(key)
+
+    st.session_state.chat_attachments = attachments
+    st.session_state["_chat_file_warning"] = warnings
+    st.session_state[CHAT_FILE_UPLOAD_KEY] = []
+    st.rerun()
+
+
+def _add_chat_images() -> None:
+    files = st.session_state.get(CHAT_IMAGE_UPLOAD_KEY) or []
+    images = list(st.session_state.get("chat_images", []))
+    existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in images}
+    warnings: List[str] = []
+
+    for upload in files:
+        key = (getattr(upload, "name", None), getattr(upload, "size", None))
+        if key in existing:
+            continue
+        if len(images) >= MAX_IMAGE_ATTACHMENTS:
+            warnings.append(f"Maximum {MAX_IMAGE_ATTACHMENTS} images par envoi.")
+            break
+        images.append(upload)
+        existing.add(key)
+
+    st.session_state.chat_images = images
+    st.session_state["_chat_image_warning"] = warnings
+    st.session_state[CHAT_IMAGE_UPLOAD_KEY] = []
+    st.rerun()
+
+
+def _remove_chat_attachment(index: int) -> None:
+    attachments = list(st.session_state.get("chat_attachments", []))
+    if 0 <= index < len(attachments):
+        attachments.pop(index)
+        st.session_state.chat_attachments = attachments
+    st.rerun()
+
+
+def _remove_chat_image(index: int) -> None:
+    images = list(st.session_state.get("chat_images", []))
+    if 0 <= index < len(images):
+        images.pop(index)
+        st.session_state.chat_images = images
+    st.rerun()
+
+
 def _render_key_gate() -> None:
     st.markdown(
         """
@@ -498,7 +616,7 @@ def _render_key_gate() -> None:
 
 
 
-def _render_sidebar() -> Dict[str, Any]:
+def _render_sidebar() -> None:
     with st.sidebar:
         st.markdown("### Paramètres")
         try:
@@ -512,10 +630,10 @@ def _render_sidebar() -> Dict[str, Any]:
 
         st.markdown("---")
         st.caption("Votre clé n'est jamais sauvegardée côté serveur.")
-        st.caption("⚡ Mode performance forcé (réglages masqués).")
+        st.caption("⚡ Mode performance activé (réglages masqués).")
 
         st.markdown("### Données")
-        uploaded_files = st.file_uploader(
+        st.file_uploader(
             "📎 Importer des fichiers",
             type=[
                 "csv",
@@ -529,6 +647,7 @@ def _render_sidebar() -> Dict[str, Any]:
                 "json",
             ],
             accept_multiple_files=True,
+            key=SIDEBAR_UPLOAD_KEY,
         )
         help_hint = (
             f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
@@ -537,15 +656,30 @@ def _render_sidebar() -> Dict[str, Any]:
             help_hint += " — Les fichiers plus lourds seront traités par morceaux."
         st.caption(help_hint)
 
-        index_clicked = st.button(
+        uploaded_files = st.session_state.get(SIDEBAR_UPLOAD_KEY) or []
+        st.button(
             "Indexer",
             use_container_width=True,
             disabled=not uploaded_files,
+            on_click=_request_indexing,
         )
-        reset_clicked = st.button(
+        st.button(
             "Réinitialiser base",
             use_container_width=True,
+            on_click=_request_rag_reset,
         )
+
+        feedback = st.session_state.get("_sidebar_feedback")
+        if isinstance(feedback, tuple) and len(feedback) == 2:
+            level, message = feedback
+            if level == "success":
+                st.success(message)
+            elif level == "warning":
+                st.warning(message)
+            elif level == "error":
+                st.error(message)
+            else:
+                st.info(message)
 
         st.markdown("---")
         doc_count = len(st.session_state.rag_docs)
@@ -666,12 +800,6 @@ def _render_sidebar() -> Dict[str, Any]:
                     st.caption(
                         "[Voir logs Streamlit Cloud](https://docs.streamlit.io/deploy/streamlit-community-cloud/get-started/manage-your-app#view-your-app-logs)"
                     )
-
-    return {
-        "uploaded_files": uploaded_files,
-        "index_clicked": index_clicked,
-        "reset_clicked": reset_clicked,
-    }
 
 
 def _usage_to_dict(usage: Optional[object]) -> Optional[Dict[str, int]]:
@@ -1059,14 +1187,7 @@ def _render_chat_interface() -> None:
                 pieces.append(text_attr)
         return "".join(pieces)
 
-    sidebar_state = _render_sidebar()
-
-    if sidebar_state["reset_clicked"]:
-        _reset_rag_state()
-        st.sidebar.success("Base documentaire réinitialisée.")
-
-    if sidebar_state["index_clicked"]:
-        _handle_indexing(sidebar_state["uploaded_files"] or [])
+    _render_sidebar()
 
     st.markdown(
         """
@@ -1175,16 +1296,11 @@ def _render_chat_interface() -> None:
             unsafe_allow_html=True,
         )
 
-    if "chat_attachments" not in st.session_state:
-        st.session_state.chat_attachments = []
-    if "chat_images" not in st.session_state:
-        st.session_state.chat_images = []
-
     with st.form("chat-composer", clear_on_submit=True):
         c1, c2, c3 = st.columns([0.08, 0.72, 0.20])
         with c1:
             with st.popover("📎", use_container_width=True):
-                files = st.file_uploader(
+                st.file_uploader(
                     "Importer des fichiers",
                     type=[
                         "csv",
@@ -1198,6 +1314,8 @@ def _render_chat_interface() -> None:
                         "json",
                     ],
                     accept_multiple_files=True,
+                    key=CHAT_FILE_UPLOAD_KEY,
+                    on_change=_add_chat_attachments,
                 )
                 help_hint = (
                     f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
@@ -1205,40 +1323,14 @@ def _render_chat_interface() -> None:
                 if ALLOW_LARGE_FILES:
                     help_hint += " — Les fichiers plus lourds seront traités par morceaux."
                 st.caption(help_hint)
-                if files:
-                    existing = {(f.name, f.size) for f in st.session_state.chat_attachments}
-                    for f in files:
-                        if (f.name, f.size) not in existing:
-                            if len(st.session_state.chat_attachments) >= MAX_FILES:
-                                st.warning(f"Maximum {MAX_FILES} fichiers par envoi.")
-                                break
-                            size = getattr(f, "size", None)
-                            if size is None:
-                                size = len(f.getvalue())
-                            if not ALLOW_LARGE_FILES and size > MAX_FILE_BYTES:
-                                st.warning(
-                                    f"{f.name} dépasse la limite de {DEFAULT_MAX_FILE_MB} Mo et sera ignoré."
-                                )
-                                continue
-                            st.session_state.chat_attachments.append(f)
 
-                img_files = st.file_uploader(
+                st.file_uploader(
                     "Images (PNG, JPG, WEBP, GIF)",
                     type=["png", "jpg", "jpeg", "webp", "gif"],
                     accept_multiple_files=True,
-                    key="chat_img_uploader",
+                    key=CHAT_IMAGE_UPLOAD_KEY,
+                    on_change=_add_chat_images,
                 )
-                if img_files:
-                    existing_images = {(f.name, getattr(f, "size", None)) for f in st.session_state.chat_images}
-                    for f in img_files:
-                        if len(st.session_state.chat_images) >= MAX_IMAGE_ATTACHMENTS:
-                            st.warning(f"Maximum {MAX_IMAGE_ATTACHMENTS} images par envoi.")
-                            break
-                        key = (f.name, getattr(f, "size", None))
-                        if key in existing_images:
-                            continue
-                        st.session_state.chat_images.append(f)
-                        existing_images.add(key)
 
         with c2:
             user_text = st.text_input(
@@ -1250,14 +1342,23 @@ def _render_chat_interface() -> None:
         with c3:
             send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
 
+    for warning in st.session_state.get("_chat_file_warning", []) or []:
+        st.warning(warning)
+
+    for warning in st.session_state.get("_chat_image_warning", []) or []:
+        st.warning(warning)
+
     if st.session_state.chat_images:
         img_cols = st.columns(min(4, len(st.session_state.chat_images)))
         for i, f in enumerate(list(st.session_state.chat_images)):
             with img_cols[i % len(img_cols)]:
                 st.image(f, caption=f.name, use_container_width=True)
-                if st.button(f"❌ Retirer image {i}", key=f"rm_img_{i}"):
-                    st.session_state.chat_images.pop(i)
-                    st.rerun()
+                st.button(
+                    f"❌ Retirer image {i}",
+                    key=f"rm_img_{i}",
+                    on_click=_remove_chat_image,
+                    args=(i,),
+                )
 
     if st.session_state.chat_attachments:
         chip_cols = st.columns(min(len(st.session_state.chat_attachments), 4))
@@ -1270,9 +1371,12 @@ def _render_chat_interface() -> None:
                     except Exception:
                         size = 0
                 st.markdown(f"🧩 **{f.name}**  ({format_bytes(size)})")
-                if st.button(f"❌ Retirer {i}", key=f"rm_{i}"):
-                    st.session_state.chat_attachments.pop(i)
-                    st.rerun()
+                st.button(
+                    f"❌ Retirer {i}",
+                    key=f"rm_{i}",
+                    on_click=_remove_chat_attachment,
+                    args=(i,),
+                )
 
     if send:
         st.session_state.quality_escalated = False
@@ -1406,7 +1510,8 @@ def _render_chat_interface() -> None:
         pipeline_result: Optional[Dict[str, Any]] = None
         pipeline_sources_info: List[Dict[str, Any]] = []
 
-        if use_rag and not is_multimodal_request:
+        vectorstore: Optional[SessionVectorStore] = None
+        if use_rag:
             vectorstore = SessionVectorStore(
                 client,
                 st.session_state.rag_index,
@@ -1415,6 +1520,7 @@ def _render_chat_interface() -> None:
                 st.session_state.rag_embedding_model or EMBEDDING_MODEL,
             )
 
+        if vectorstore is not None and not is_multimodal_request:
             base_cfg = effective_params_from_mode()
             active_cfg = base_cfg
             quality_applied = False
@@ -1542,18 +1648,9 @@ def _render_chat_interface() -> None:
         sources_info: List[Dict[str, Any]] = []
 
         hits: List[Any] = []
-        if use_rag:
+        if vectorstore is not None:
             try:
-                query = query_for_rag
-                hits = retrieve(
-                    client,
-                    query,
-                    st.session_state.rag_index,
-                    st.session_state.rag_texts,
-                    st.session_state.rag_meta,
-                    st.session_state.rag_embedding_model or EMBEDDING_MODEL,
-                    k=st.session_state.rag_k,
-                )
+                hits = _session_retrieve(vectorstore, query_for_rag, k=st.session_state.rag_k)
             except Exception as error:  # noqa: BLE001 - surface gracefully
                 st.warning(f"Recherche contextuelle indisponible : {error}")
                 hits = []
@@ -1777,6 +1874,7 @@ def _render_chat_interface() -> None:
 if __name__ == "__main__":
     _init_session_state()
     set_defaults_if_needed()
+    _process_pending_actions()
 
     if not st.session_state.api_key:
         _render_key_gate()
