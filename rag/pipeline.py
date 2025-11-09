@@ -121,7 +121,7 @@ def run_rag_pipeline(
     diagnostics["history_chars"] = len(history_summary)
 
     retrieval_start = time.perf_counter()
-    docs = retrieve(vectorstore, query, k=cfg.rag_k, cfg=cfg)
+    docs = retrieve(vectorstore, query, k=cfg.rag_k, state=cfg)
     diagnostics["retrieval_time_s"] = round(time.perf_counter() - retrieval_start, 3)
     diagnostics["retrieved_docs"] = len(docs)
     diagnostics["rerank_used"] = bool(cfg.use_reranker and not cfg.use_mmr)

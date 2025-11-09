@@ -44,6 +44,34 @@ load_dotenv()
 
 st.set_page_config(page_title="ChatGPT-like Chatbot", layout="wide")
 
+
+def _init_perf_state() -> None:
+    """Initialize high-performance defaults once per session."""
+
+    st.session_state.setdefault("selected_model", "gpt-4o-mini")
+
+    # RAG performance tuning
+    st.session_state.setdefault("rag_k", 4)
+    st.session_state.setdefault("use_mmr", True)
+    st.session_state.setdefault("mmr_fetch_k", 24)
+    st.session_state.setdefault("mmr_lambda", 0.5)
+
+    # No reranker / multipass in perf mode
+    st.session_state.setdefault("use_reranker", False)
+    st.session_state.setdefault("use_multipass", False)
+
+    # Generation parameters tuned for speed
+    st.session_state.setdefault("gen_temperature", 0.6)
+    st.session_state.setdefault("gen_top_p", 0.9)
+    st.session_state.setdefault("gen_max_tokens", 900)
+    st.session_state.setdefault("gen_streaming", True)
+
+    st.session_state.setdefault("mode", "performance")
+    st.session_state.setdefault("quality_escalated", False)
+
+
+_init_perf_state()
+
 if "app_config" not in st.session_state:
     base_cfg = PerfConfig()
     if os.getenv("QUALITY_ESCALATION", "0") == "1":
@@ -51,21 +79,6 @@ if "app_config" not in st.session_state:
     st.session_state.app_config = base_cfg
 
 CFG: PerfConfig = st.session_state.app_config
-
-
-def perf_params_to_state_bridge() -> None:
-    st.session_state.setdefault("selected_model", CFG.default_model)
-    st.session_state.setdefault("rag_k", CFG.rag_k)
-    st.session_state.setdefault("use_multipass", CFG.use_multipass)
-    st.session_state.setdefault("use_reranker", CFG.use_reranker)
-    st.session_state.setdefault("gen_temperature", CFG.temperature)
-    st.session_state.setdefault("gen_top_p", CFG.top_p)
-    st.session_state.setdefault("gen_max_tokens", CFG.max_tokens)
-    st.session_state.setdefault("mode", "performance")
-    st.session_state.setdefault("quality_escalated", False)
-
-
-perf_params_to_state_bridge()
 
 AVAILABLE_MODELS = [
     "gpt-4o",
@@ -136,7 +149,20 @@ DBML_ENFORCEMENT_PROMPT = (
 
 
 def effective_params_from_mode() -> PerfConfig:
-    return CFG
+    return PerfConfig(
+        default_model=st.session_state.get("selected_model", CFG.default_model),
+        rag_k=int(st.session_state.get("rag_k", CFG.rag_k)),
+        use_mmr=bool(st.session_state.get("use_mmr", CFG.use_mmr)),
+        mmr_fetch_k=int(st.session_state.get("mmr_fetch_k", CFG.mmr_fetch_k)),
+        mmr_lambda=float(st.session_state.get("mmr_lambda", CFG.mmr_lambda)),
+        use_reranker=bool(st.session_state.get("use_reranker", CFG.use_reranker)),
+        use_multipass=bool(st.session_state.get("use_multipass", CFG.use_multipass)),
+        temperature=float(st.session_state.get("gen_temperature", CFG.temperature)),
+        top_p=float(st.session_state.get("gen_top_p", CFG.top_p)),
+        max_tokens=int(st.session_state.get("gen_max_tokens", CFG.max_tokens)),
+        streaming=bool(st.session_state.get("gen_streaming", CFG.streaming)),
+        quality_escalation=CFG.quality_escalation,
+    )
 
 
 def with_quality_boost(params: PerfConfig) -> PerfConfig:
@@ -230,7 +256,7 @@ def _remove_api_key() -> None:
 
 def set_defaults_if_needed(*, force: bool = False) -> None:
     _ = force
-    perf_params_to_state_bridge()
+    _init_perf_state()
 
 
 def _rag_is_ready() -> bool:
@@ -486,6 +512,7 @@ def _render_sidebar() -> Dict[str, Any]:
 
         st.markdown("---")
         st.caption("Votre clé n'est jamais sauvegardée côté serveur.")
+        st.caption("⚡ Mode performance forcé (réglages masqués).")
 
         st.markdown("### Données")
         uploaded_files = st.file_uploader(
@@ -543,11 +570,6 @@ def _render_sidebar() -> Dict[str, Any]:
             st.caption("Aucun document indexé.")
 
         st.markdown("---")
-        st.markdown("### Mode performance")
-        st.caption("⚡ Mode performance activé : paramètres RAG & génération optimisés par défaut.")
-        if CFG.quality_escalation:
-            st.caption("La qualité automatique peut s'activer en arrière-plan si nécessaire.")
-
         with st.expander("Diagnostics", expanded=False):
             diag = st.session_state.get("rag_diagnostics") or {}
             if not diag:
@@ -870,7 +892,7 @@ def call_llm(
             client,
             model,
             payload_messages,
-            stream=True,
+            stream=st.session_state.gen_streaming,
             on_delta=on_delta,
         )
     except Exception as exc:
@@ -1108,7 +1130,7 @@ def _render_chat_interface() -> None:
     st.markdown("<div class='chat-header'>ChatGPT-like Chatbot</div>", unsafe_allow_html=True)
 
     if _rag_is_ready():
-        st.markdown(f"🧠 RAG actif (k={CFG.rag_k})")
+        st.markdown(f"🧠 RAG actif (k={st.session_state.rag_k})")
 
     for message in st.session_state.messages:
         if message["role"] == "system":
@@ -1530,7 +1552,7 @@ def _render_chat_interface() -> None:
                     st.session_state.rag_texts,
                     st.session_state.rag_meta,
                     st.session_state.rag_embedding_model or EMBEDDING_MODEL,
-                    k=CFG.rag_k,
+                    k=st.session_state.rag_k,
                 )
             except Exception as error:  # noqa: BLE001 - surface gracefully
                 st.warning(f"Recherche contextuelle indisponible : {error}")
@@ -1590,12 +1612,13 @@ def _render_chat_interface() -> None:
             "rag_hits": len(hits),
             "sources_count": len(sources_info),
             "usage": None,
-            "temperature": CFG.temperature,
-            "top_p": CFG.top_p,
-            "max_tokens": CFG.max_tokens,
-            "rag_k": CFG.rag_k,
-            "multipass": CFG.use_multipass,
-            "rerank": CFG.use_reranker,
+            "temperature": st.session_state.gen_temperature,
+            "top_p": st.session_state.gen_top_p,
+            "max_tokens": st.session_state.gen_max_tokens,
+            "rag_k": st.session_state.rag_k,
+            "multipass": st.session_state.use_multipass,
+            "rerank": st.session_state.use_reranker,
+            "streaming": st.session_state.gen_streaming,
             "mode": "performance",
             "pipeline_diagnostics": st.session_state.get("rag_diagnostics"),
         }

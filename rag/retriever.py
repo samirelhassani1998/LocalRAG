@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Sequence, Tuple
-
-from config import PerfConfig
+from typing import Any, Iterable, List, Protocol, Sequence, Tuple
 
 @dataclass
 class Document:
@@ -51,11 +49,18 @@ def _bm25_rerank(query: str, docs: Sequence[Document], k: int) -> List[Document]
     return [doc for doc, _ in ranked[:k]]
 
 
+class RetrieverState(Protocol):
+    use_mmr: bool
+    mmr_fetch_k: int
+    mmr_lambda: float
+    use_reranker: bool
+
+
 def retrieve(
     vectorstore,
     query: str,
     k: int,
-    cfg: PerfConfig,
+    state: RetrieverState | Any,
 ) -> List[Document]:
     """Return the top-k documents using configuration-driven logic."""
 
@@ -65,22 +70,22 @@ def retrieve(
     target_k = max(int(k or 0), 1)
     docs: Sequence[Document] = []
 
-    if cfg.use_mmr:
-        fetch_k = max(cfg.mmr_fetch_k, target_k * 6)
+    use_mmr = bool(getattr(state, "use_mmr", False))
+    if use_mmr:
+        fetch_k = max(int(getattr(state, "mmr_fetch_k", target_k * 6)), target_k * 6)
+        lambda_mult = float(getattr(state, "mmr_lambda", 0.5))
         try:
             docs = vectorstore.max_marginal_relevance_search(
                 query,
                 k=target_k,
                 fetch_k=fetch_k,
-                lambda_mult=cfg.mmr_lambda,
-            )
+                lambda_mult=lambda_mult,
+            ) or []
+            docs = [doc for doc in docs if doc and getattr(doc, "page_content", None)]
+            if docs:
+                return list(docs[:target_k])
         except Exception:
-            try:
-                docs = vectorstore.similarity_search(query, k=target_k)
-            except Exception:
-                docs = []
-        docs = [doc for doc in docs if doc and getattr(doc, "page_content", None)]
-        return list(docs[:target_k])
+            pass
 
     fetch_k = max(target_k * 3, target_k)
     try:
@@ -91,7 +96,7 @@ def retrieve(
     if not docs:
         return []
 
-    if not cfg.use_reranker:
+    if not bool(getattr(state, "use_reranker", False)):
         return list(docs[:target_k])
 
     model = _get_cross_encoder()
