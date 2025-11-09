@@ -36,6 +36,7 @@ from token_utils import (
 from utils.rendering import extract_code_block, try_extract_dbml_heuristic
 from rag.pipeline import run_rag_pipeline
 from rag.retriever import Document
+from quality.escalation import need_quality_escalation, output_is_poor, expects_dbml
 
 load_dotenv()
 
@@ -49,6 +50,8 @@ if "mode_defaults_applied_for" not in st.session_state:
     st.session_state.mode_defaults_applied_for = None
 if "ui_mode_selector" not in st.session_state:
     st.session_state.ui_mode_selector = "Performance"
+if "quality_escalated" not in st.session_state:
+    st.session_state.quality_escalated = False
 
 AVAILABLE_MODELS = [
     "gpt-4o",
@@ -116,6 +119,36 @@ GLOBAL_SYSTEM_MESSAGE = {"role": "system", "content": GLOBAL_SYSTEM_PROMPT}
 DBML_ENFORCEMENT_PROMPT = (
     "Quand l’utilisateur mentionne DBML/dbdiagram, renvoie UNIQUEMENT un bloc ```dbml sans explication après."
 )
+
+
+def effective_params_from_mode() -> Dict[str, Any]:
+    perf = st.session_state.mode == "performance"
+    params = {
+        "k": st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K if perf else DEFAULT_RETRIEVAL_K),
+        "use_multipass": st.session_state.get("use_multipass", not perf),
+        "use_reranker": st.session_state.get("use_reranker", not perf),
+        "temperature": st.session_state.get("gen_temperature", PERFORMANCE_DEFAULT_TEMPERATURE if perf else DEFAULT_TEMPERATURE),
+        "top_p": st.session_state.get("gen_top_p", PERFORMANCE_DEFAULT_TOP_P if perf else DEFAULT_TOP_P),
+        "max_tokens": st.session_state.get("gen_max_tokens", PERFORMANCE_DEFAULT_MAX_TOKENS if perf else DEFAULT_MAX_TOKENS),
+        "mode": "performance" if perf else "qualite",
+    }
+    return params
+
+
+def with_quality_boost(params: Dict[str, Any]) -> Dict[str, Any]:
+    boosted = params.copy()
+    boosted.update(
+        {
+            "k": max(int(params.get("k", 0)), 8),
+            "use_multipass": True,
+            "use_reranker": True,
+            "max_tokens": max(int(params.get("max_tokens", 0)), 2000),
+            "temperature": max(float(params.get("temperature", 0.0)), 0.7),
+            "top_p": max(float(params.get("top_p", 0.0)), 0.95),
+            "mode": "qualite",
+        }
+    )
+    return boosted
 
 
 def _contains_image_parts(message: Optional[Dict[str, Any]]) -> bool:
@@ -555,6 +588,8 @@ def _render_sidebar() -> Dict[str, Any]:
         st.caption(
             "⚡ Performance" if st.session_state.mode == "performance" else "🔎 Qualité"
         )
+        if st.session_state.get("quality_escalated"):
+            st.caption("Qualité auto activée pour cette requête (DBML/Code/Analyse détecté)")
 
         st.slider(
             "k (passages)",
@@ -1320,10 +1355,9 @@ def _render_chat_interface() -> None:
                     st.rerun()
 
     if send:
+        st.session_state.quality_escalated = False
         text_value = user_text.strip() if user_text else ""
-        dbml_requested = bool(
-            re.search(r"\b(dbml|dbdiagram)\b", text_value, re.IGNORECASE)
-        )
+        dbml_requested = expects_dbml(text_value)
         attachments: List[Dict[str, Any]] = []
         oversized: List[tuple[str, int]] = []
 
@@ -1460,26 +1494,48 @@ def _render_chat_interface() -> None:
                 st.session_state.rag_meta,
                 st.session_state.rag_embedding_model or EMBEDDING_MODEL,
             )
-            try:
-                pipeline_result = run_rag_pipeline(
+
+            params = effective_params_from_mode()
+            quality_applied = False
+
+            def _run_with(p: Dict[str, Any]) -> Dict[str, Any]:
+                return run_rag_pipeline(
                     client,
                     selected_model,
                     vectorstore,
                     query_for_rag,
                     st.session_state.messages,
-                    k=int(st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K)),
-                    temperature=float(
-                        st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE)
-                    ),
-                    top_p=float(st.session_state.get("gen_top_p", DEFAULT_TOP_P)),
-                    max_tokens=int(
-                        st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS)
-                    ),
-                    enable_multipass=bool(st.session_state.get("use_multipass", True)),
-                    enable_rerank=bool(st.session_state.get("use_reranker", False)),
-                    mode=st.session_state.mode,
+                    k=int(p.get("k", PERFORMANCE_DEFAULT_K)),
+                    temperature=float(p.get("temperature", DEFAULT_TEMPERATURE)),
+                    top_p=float(p.get("top_p", DEFAULT_TOP_P)),
+                    max_tokens=int(p.get("max_tokens", DEFAULT_MAX_TOKENS)),
+                    enable_multipass=bool(p.get("use_multipass", True)),
+                    enable_rerank=bool(p.get("use_reranker", False)),
+                    mode=p.get("mode", st.session_state.mode),
                 )
+
+            try:
+                if need_quality_escalation(text_value or query_for_rag, use_rag):
+                    params = with_quality_boost(params)
+                    quality_applied = True
+
+                pipeline_result = _run_with(params)
                 st.session_state.rag_diagnostics = pipeline_result.get("diagnostics")
+
+                final_answer_text = pipeline_result.get("answer", "") if pipeline_result else ""
+                if (
+                    pipeline_result
+                    and output_is_poor(final_answer_text, expect_dbml=dbml_requested)
+                    and not quality_applied
+                ):
+                    boosted_params = with_quality_boost(params)
+                    if boosted_params != params:
+                        params = boosted_params
+                        quality_applied = True
+                        pipeline_result = _run_with(params)
+                        st.session_state.rag_diagnostics = pipeline_result.get("diagnostics")
+
+                st.session_state.quality_escalated = quality_applied
             except Exception as error:  # noqa: BLE001 - fallback to classic path
                 st.warning(f"Pipeline RAG indisponible : {error}")
                 st.session_state.rag_diagnostics = None
