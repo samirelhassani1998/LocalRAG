@@ -6,7 +6,7 @@ class PerfConfig:
     """Container describing the Retrieval-Augmented Generation defaults."""
 
     # Modèle
-    default_model: str = "gpt-4o"
+    default_model: str = "gpt-5.1"
 
     # RAG
     rag_k: int = 8

@@ -6,7 +6,7 @@ URL: https://laposte-57sgwe24hqzegfthseuprg.streamlit.app/
 ## Features
 
 - **Inline API key capture**: Provide your OpenAI API key inside the app—no need for `st.secrets`.
-- **Model selection**: Switch between available models such as GPT-4o, GPT-4o mini, and GPT-5 (if enabled on your account).
+- **Model selection**: Switch between available GPT-5 generation models (GPT-5.1, GPT-5.1 mini, GPT-5, GPT-5 mini) if enabled on your account.
 - **Clean conversation view**: Messages are displayed in a vertically stacked chat log with a chat input area at the bottom of the screen.
 - **Session persistence**: The API key and conversation history live in `st.session_state` during the browsing session.
 

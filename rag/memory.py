@@ -65,7 +65,7 @@ def summarize_history(
     )
 
     try:
-        summary = llm_call_simple(client, "gpt-4o-mini", prompt)
+        summary = llm_call_simple(client, "gpt-5.1-mini", prompt)
     except Exception:
         return window[:max_chars]
 

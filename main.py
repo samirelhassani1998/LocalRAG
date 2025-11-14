@@ -2,6 +2,7 @@ import os
 import re
 import urllib.parse as _url
 from html import escape
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Sequence
 from types import SimpleNamespace
 from dataclasses import replace
@@ -13,20 +14,16 @@ from openai import OpenAI
 
 from adapters import to_chat_messages, to_responses_input
 
-from image_utils import to_image_part
 from rag_utils import (
     ALLOW_LARGE_FILES,
     DEFAULT_MAX_FILE_MB,
     FAISS_IMPORT_ERROR,
     add_embeddings_to_index,
     embed_texts,
-    clear_status_callbacks,
-    configure_status_callbacks,
     format_context,
     format_source_badge,
     format_bytes,
     human_readable_size,
-    index_files_from_chat,
     load_file_to_chunks,
 )
 from token_utils import (
@@ -47,18 +44,18 @@ QUALITY_ESCALATION_ENABLED = os.getenv("QUALITY_ESCALATION", "1") != "0"
 CFG: PerfConfig = PerfConfig(quality_escalation=QUALITY_ESCALATION_ENABLED)
 
 AVAILABLE_MODELS = [
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4.1",
+    "gpt-5.1",
+    "gpt-5.1-mini",
     "gpt-5",
+    "gpt-5-mini",
 ]
 
 
-PREFERRED_MODELS = ["gpt-5", "gpt-4o", "gpt-4o-mini"]
+PREFERRED_MODELS = ["gpt-5.1", "gpt-5.1-mini", "gpt-5", "gpt-5-mini"]
 
 
 EMBEDDING_MODEL = "text-embedding-3-large"
-VISION_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-5"}
+VISION_MODELS = {"gpt-5.1", "gpt-5.1-mini", "gpt-5", "gpt-5-mini"}
 MAX_INPUT_TOKENS = 300_000
 RESERVE_OUTPUT_TOKENS = 1_000
 MAX_RAG_CONTEXT_TOKENS = 30_000
@@ -68,9 +65,23 @@ CHUNK_MAX_CHARS = 4000
 CHUNK_OVERLAP = 400
 MAX_IMAGE_ATTACHMENTS = 5
 
+CHAT_DOCUMENT_EXTENSIONS = [
+    "csv",
+    "tsv",
+    "xls",
+    "xlsx",
+    "pdf",
+    "docx",
+    "txt",
+    "md",
+    "json",
+    "ndjson",
+]
+CHAT_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif"]
+CHAT_FILE_EXTENSIONS = CHAT_DOCUMENT_EXTENSIONS + CHAT_IMAGE_EXTENSIONS
+
 SIDEBAR_UPLOAD_KEY = "sidebar_uploaded_files"
 CHAT_FILE_UPLOAD_KEY = "chat_file_uploader"
-CHAT_IMAGE_UPLOAD_KEY = "chat_image_uploader"
 
 RAG_DEFAULTS = {
     "k": CFG.rag_k,
@@ -209,17 +220,19 @@ def _init_session_state() -> None:
         "quality_escalated": False,
         "chat_attachments": [],
         "chat_images": [],
+        "chat_documents": [],
+        "chat_doc_texts": [],
+        "chat_doc_metas": [],
+        "chat_doc_index": None,
+        "chat_doc_embedding_model": EMBEDDING_MODEL,
         "show_logs": False,
         "last_call_log": None,
         "_sidebar_feedback": None,
         "_chat_file_warning": [],
-        "_chat_image_warning": [],
-        "_chat_file_uploader_epoch": 0,
-        "_chat_image_uploader_epoch": 0,
         "_pending_rag_reset": False,
         "_pending_rag_index": False,
-        "_pending_chat_submit": None,
         SIDEBAR_UPLOAD_KEY: [],
+        CHAT_FILE_UPLOAD_KEY: None,
     }
 
     for key, value in defaults.items():
@@ -229,6 +242,17 @@ def _init_session_state() -> None:
 
 def _reset_chat() -> None:
     st.session_state.messages = [dict(GLOBAL_SYSTEM_MESSAGE)]
+    for entry in st.session_state.get("chat_images", []) or []:
+        _delete_remote_file(entry.get("file_id"))
+    st.session_state.chat_attachments = []
+    st.session_state.chat_images = []
+    st.session_state.chat_documents = []
+    st.session_state.chat_doc_texts = []
+    st.session_state.chat_doc_metas = []
+    st.session_state.chat_doc_index = None
+    st.session_state.chat_doc_embedding_model = EMBEDDING_MODEL
+    st.session_state[CHAT_FILE_UPLOAD_KEY] = None
+    st.session_state["_chat_file_warning"] = []
 
 
 def _reset_rag_state() -> None:
@@ -488,47 +512,166 @@ def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
         st.warning(warn)
 
 
-def _chat_file_uploader_key() -> str:
-    return f"{CHAT_FILE_UPLOAD_KEY}_{st.session_state.get('_chat_file_uploader_epoch', 0)}"
+def _uploaded_file_extension(uploaded_file: UploadedFile) -> str:
+    name = getattr(uploaded_file, "name", "") or ""
+    if "." not in name:
+        return ""
+    return name.rsplit(".", 1)[-1].lower()
 
 
-def _chat_image_uploader_key() -> str:
-    return f"{CHAT_IMAGE_UPLOAD_KEY}_{st.session_state.get('_chat_image_uploader_epoch', 0)}"
+def _fingerprint_upload(uploaded_file: UploadedFile) -> tuple[str, int]:
+    name = getattr(uploaded_file, "name", "document") or "document"
+    size = getattr(uploaded_file, "size", None)
+    if size is None:
+        try:
+            size = len(uploaded_file.getvalue())
+        except Exception:
+            size = 0
+    return (str(name), int(size or 0))
 
 
-def _reset_chat_file_uploader_widget() -> None:
-    st.session_state["_chat_file_uploader_epoch"] = (
-        st.session_state.get("_chat_file_uploader_epoch", 0) + 1
-    )
+def _create_chat_document_entry(uploaded_file: UploadedFile) -> tuple[Optional[Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+    try:
+        chunks, summary, chunk_warnings = load_file_to_chunks(
+            uploaded_file,
+            max_chars=CHUNK_MAX_CHARS,
+            overlap=CHUNK_OVERLAP,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced in UI
+        warnings.append(f"{getattr(uploaded_file, 'name', 'Fichier')} : {exc}")
+        return None, warnings
+
+    if chunk_warnings:
+        warnings.extend(chunk_warnings)
+
+    if not chunks:
+        warnings.append(
+            f"{getattr(uploaded_file, 'name', 'Fichier')} ne contient aucun texte exploitable."
+        )
+        return None, warnings
+
+    chunk_texts = [chunk.text for chunk in chunks]
+    source_label = getattr(uploaded_file, "name", "document") or "document"
+    chunk_metas: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        meta = dict(chunk.meta or {})
+        meta.setdefault("source", f"{source_label} (chat)")
+        meta.setdefault("origin", "chat")
+        chunk_metas.append(meta)
+
+    size = getattr(uploaded_file, "size", None)
+    if size is None:
+        try:
+            size = len(uploaded_file.getvalue())
+        except Exception:
+            size = 0
+
+    entry = {
+        "name": (summary or {}).get("name") or getattr(uploaded_file, "name", "document"),
+        "mime": getattr(uploaded_file, "type", None),
+        "size_bytes": int(size or 0),
+        "content": list(chunk_texts),
+        "chunks": list(chunk_texts),
+        "chunk_metas": chunk_metas,
+        "summary": summary or {},
+        "fingerprint": _fingerprint_upload(uploaded_file),
+        "pending": True,
+        "embedded": False,
+    }
+    return entry, warnings
 
 
-def _reset_chat_image_uploader_widget() -> None:
-    st.session_state["_chat_image_uploader_epoch"] = (
-        st.session_state.get("_chat_image_uploader_epoch", 0) + 1
-    )
+def _upload_chat_image(client: OpenAI, uploaded_file: UploadedFile) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        data = uploaded_file.getvalue()
+    except Exception as exc:  # noqa: BLE001 - surfaced as warning
+        return None, f"Impossible de lire {uploaded_file.name} : {exc}"
+
+    if not data:
+        return None, f"{uploaded_file.name} est vide."
+
+    buffer = BytesIO(data)
+    buffer.name = getattr(uploaded_file, "name", "image") or "image"
+    try:
+        response = client.files.create(file=buffer, purpose="vision")
+    except Exception as exc:  # noqa: BLE001 - surface gracefully
+        return None, f"Téléversement impossible pour {uploaded_file.name} : {exc}"
+
+    entry = {
+        "name": getattr(uploaded_file, "name", "Image"),
+        "size_bytes": len(data),
+        "file_id": getattr(response, "id", None),
+        "data": data,
+        "mime": getattr(uploaded_file, "type", None),
+    }
+    if not entry["file_id"]:
+        return None, f"Identifiant de fichier manquant pour {uploaded_file.name}."
+    return entry, None
+
+
+def _delete_remote_file(file_id: Optional[str]) -> None:
+    if not file_id:
+        return
+    api_key = st.session_state.get("api_key")
+    if not api_key:
+        return
+    try:
+        client = OpenAI(api_key=api_key)
+        client.files.delete(file_id)
+    except Exception:  # noqa: BLE001 - best effort cleanup
+        return
 
 
 def _add_chat_attachments(files: Optional[Sequence[UploadedFile]]) -> None:
-    """Persist uploaded files as pending chat attachments."""
+    """Persist uploaded files/images as pending chat attachments."""
 
     if not files:
         return
 
     attachments = list(st.session_state.get("chat_attachments", []))
-    existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in attachments}
+    images: List[Dict[str, Any]] = list(st.session_state.get("chat_images", []))
+    existing_files = {_fingerprint_upload(f) for f in attachments}
+    existing_docs = {
+        tuple(doc.get("fingerprint", ()))
+        for doc in st.session_state.get("chat_documents", [])
+        if doc.get("fingerprint")
+    }
     warnings: List[str] = []
     processed = False
+    client: Optional[OpenAI] = None
 
     for upload in files:
         if upload is None:
             continue
         processed = True
-        key = (getattr(upload, "name", None), getattr(upload, "size", None))
-        if key in existing:
+        fingerprint = _fingerprint_upload(upload)
+        ext = _uploaded_file_extension(upload)
+
+        if ext in CHAT_IMAGE_EXTENSIONS:
+            if len(images) >= MAX_IMAGE_ATTACHMENTS:
+                warnings.append(f"Maximum {MAX_IMAGE_ATTACHMENTS} images par envoi.")
+                continue
+            if fingerprint in {(_img.get("name"), _img.get("size_bytes")) for _img in images}:
+                continue
+            if client is None:
+                api_key = st.session_state.get("api_key")
+                if not api_key:
+                    warnings.append("Ajoutez une clé API pour analyser les images.")
+                    break
+                client = OpenAI(api_key=api_key)
+            entry, err = _upload_chat_image(client, upload)
+            if err:
+                warnings.append(err)
+                continue
+            if entry:
+                images.append(entry)
             continue
+
         if len(attachments) >= MAX_FILES:
             warnings.append(f"Maximum {MAX_FILES} fichiers par envoi.")
             break
+
         size = getattr(upload, "size", None)
         if size is None:
             try:
@@ -540,49 +683,113 @@ def _add_chat_attachments(files: Optional[Sequence[UploadedFile]]) -> None:
                 f"{getattr(upload, 'name', 'Fichier')} dépasse la limite de {DEFAULT_MAX_FILE_MB} Mo et a été ignoré."
             )
             continue
+
+        if fingerprint in existing_files:
+            continue
+
+        doc_entry, doc_warnings = _create_chat_document_entry(upload)
+        if doc_warnings:
+            warnings.extend(doc_warnings)
+        if doc_entry is None:
+            continue
+        if tuple(doc_entry.get("fingerprint")) in existing_docs:
+            continue
         attachments.append(upload)
-        existing.add(key)
+        existing_files.add(fingerprint)
+        existing_docs.add(tuple(doc_entry.get("fingerprint")))
+        st.session_state.chat_documents.append(doc_entry)
 
     if processed:
         st.session_state.chat_attachments = attachments
+        st.session_state.chat_images = images
         st.session_state["_chat_file_warning"] = warnings
-        _reset_chat_file_uploader_widget()
+        st.session_state[CHAT_FILE_UPLOAD_KEY] = None
 
 
-def _add_chat_images(files: Optional[Sequence[UploadedFile]]) -> None:
-    """Persist uploaded images as pending chat attachments."""
+def _activate_pending_chat_documents(client: OpenAI) -> None:
+    """Embed pending chat documents so they can be retrieved later."""
 
-    if not files:
+    pending_docs = [doc for doc in st.session_state.get("chat_documents", []) if doc.get("pending")]
+    if not pending_docs:
         return
 
-    images = list(st.session_state.get("chat_images", []))
-    existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in images}
-    warnings: List[str] = []
-    processed = False
+    chunk_texts: List[str] = []
+    chunk_metas: List[Dict[str, Any]] = []
+    for doc in pending_docs:
+        doc_chunks = list(doc.get("chunks") or [])
+        doc_metas = list(doc.get("chunk_metas") or [])
+        if len(doc_metas) < len(doc_chunks):
+            doc_metas.extend({} for _ in range(len(doc_chunks) - len(doc_metas)))
+        for idx, chunk_text in enumerate(doc_chunks):
+            if not chunk_text:
+                continue
+            meta = dict(doc_metas[idx] if idx < len(doc_metas) else {})
+            meta.setdefault("source", doc.get("name") or f"doc_{idx}")
+            meta.setdefault("origin", "chat")
+            chunk_texts.append(chunk_text)
+            chunk_metas.append(meta)
 
-    for upload in files:
-        if upload is None:
-            continue
-        processed = True
-        key = (getattr(upload, "name", None), getattr(upload, "size", None))
-        if key in existing:
-            continue
-        if len(images) >= MAX_IMAGE_ATTACHMENTS:
-            warnings.append(f"Maximum {MAX_IMAGE_ATTACHMENTS} images par envoi.")
-            break
-        images.append(upload)
-        existing.add(key)
+    if not chunk_texts:
+        for doc in pending_docs:
+            doc["pending"] = False
+            doc["embedded"] = False
+        return
 
-    if processed:
-        st.session_state.chat_images = images
-        st.session_state["_chat_image_warning"] = warnings
-        _reset_chat_image_uploader_widget()
+    embedding_model = st.session_state.get("chat_doc_embedding_model") or EMBEDDING_MODEL
+    embeddings = embed_texts(client, embedding_model, chunk_texts)
+    if getattr(embeddings, "size", 0) == 0:
+        st.warning("Impossible de calculer les embeddings pour les pièces jointes du chat.")
+        return
+
+    st.session_state.chat_doc_index = add_embeddings_to_index(
+        st.session_state.get("chat_doc_index"),
+        embeddings,
+    )
+    st.session_state.chat_doc_texts.extend(chunk_texts)
+    st.session_state.chat_doc_metas.extend(chunk_metas)
+    st.session_state.chat_doc_embedding_model = embedding_model
+    for doc in pending_docs:
+        doc["pending"] = False
+        doc["embedded"] = True
+
+
+def _retrieve_chat_documents(client: OpenAI, query: str, *, k: Optional[int] = None) -> List[Document]:
+    index = st.session_state.get("chat_doc_index")
+    texts: Sequence[str] = st.session_state.get("chat_doc_texts") or []
+    metas: Sequence[Dict[str, Any]] = st.session_state.get("chat_doc_metas") or []
+    if index is None or not texts:
+        return []
+    target_k = int(k or st.session_state.get("rag_k", RAG_DEFAULTS["k"]))
+    vectorstore = SessionVectorStore(
+        client,
+        index,
+        texts,
+        metas,
+        st.session_state.get("chat_doc_embedding_model") or EMBEDDING_MODEL,
+    )
+    return _session_retrieve(vectorstore, query, k=target_k)
+
+
+def _documents_to_hits(docs: Sequence[Document]) -> List[tuple[str, Dict[str, Any], float]]:
+    hits: List[tuple[str, Dict[str, Any], float]] = []
+    for doc in docs:
+        meta = dict(getattr(doc, "metadata", None) or {})
+        score = float(meta.get("score", 0.0))
+        hits.append((getattr(doc, "page_content", "") or "", meta, score))
+    return hits
 
 
 def _remove_chat_attachment(index: int) -> None:
     attachments = list(st.session_state.get("chat_attachments", []))
     if 0 <= index < len(attachments):
-        attachments.pop(index)
+        removed = attachments.pop(index)
+        fingerprint = _fingerprint_upload(removed)
+        remaining_docs: List[Dict[str, Any]] = []
+        for doc in st.session_state.get("chat_documents", []):
+            if doc.get("pending") and tuple(doc.get("fingerprint")) == fingerprint:
+                continue
+            remaining_docs.append(doc)
+        st.session_state.chat_documents = remaining_docs
         st.session_state.chat_attachments = attachments
     st.rerun()
 
@@ -590,7 +797,8 @@ def _remove_chat_attachment(index: int) -> None:
 def _remove_chat_image(index: int) -> None:
     images = list(st.session_state.get("chat_images", []))
     if 0 <= index < len(images):
-        images.pop(index)
+        image_entry = images.pop(index)
+        _delete_remote_file(image_entry.get("file_id"))
         st.session_state.chat_images = images
     st.rerun()
 
@@ -962,7 +1170,7 @@ def do_call(
 
     if has_images and model not in VISION_MODELS:
         raise ValueError(
-            "Ce modèle n’accepte pas d’images. Choisissez gpt-4o / gpt-4o-mini / gpt-5."
+            "Ce modèle n’accepte pas d’images. Choisissez gpt-5/gpt-5-mini/gpt-5.1/gpt-5.1-mini."
         )
 
     if has_images:
@@ -1360,40 +1568,22 @@ def _render_chat_interface() -> None:
         )
 
     chat_files: Optional[Sequence[UploadedFile]] = None
-    chat_images: Optional[Sequence[UploadedFile]] = None
     uploads_col, composer_col = st.columns([0.1, 0.9])
     with uploads_col:
         with st.popover("📎", use_container_width=True):
             chat_files = st.file_uploader(
-                "Importer des fichiers",
-                type=[
-                    "csv",
-                    "tsv",
-                    "xlsx",
-                    "xls",
-                    "pdf",
-                    "docx",
-                    "txt",
-                    "md",
-                    "json",
-                    "ndjson",
-                ],
+                "Importer des fichiers ou images",
+                type=CHAT_FILE_EXTENSIONS,
                 accept_multiple_files=True,
-                key=_chat_file_uploader_key(),
+                key=CHAT_FILE_UPLOAD_KEY,
             )
             help_hint = (
-                f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
+                f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • Docs : CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
+                " — Images : PNG/JPG/JPEG/WebP/GIF"
             )
             if ALLOW_LARGE_FILES:
-                help_hint += " — Les fichiers plus lourds seront traités par morceaux."
+                help_hint += " — Les fichiers plus lourds seront automatiquement segmentés."
             st.caption(help_hint)
-
-            chat_images = st.file_uploader(
-                "Images (PNG, JPG, WEBP, GIF)",
-                type=["png", "jpg", "jpeg", "webp", "gif"],
-                accept_multiple_files=True,
-                key=_chat_image_uploader_key(),
-            )
 
     send = False
     user_text = ""
@@ -1411,19 +1601,15 @@ def _render_chat_interface() -> None:
                 send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
 
     _add_chat_attachments(chat_files)
-    _add_chat_images(chat_images)
 
     for warning in st.session_state.get("_chat_file_warning", []) or []:
         st.warning(warning)
 
-    for warning in st.session_state.get("_chat_image_warning", []) or []:
-        st.warning(warning)
-
     if st.session_state.chat_images:
         img_cols = st.columns(min(4, len(st.session_state.chat_images)))
-        for i, f in enumerate(list(st.session_state.chat_images)):
+        for i, entry in enumerate(list(st.session_state.chat_images)):
             with img_cols[i % len(img_cols)]:
-                st.image(f, caption=f.name, use_container_width=True)
+                st.image(entry.get("data"), caption=entry.get("name"), use_container_width=True)
                 st.button(
                     f"❌ Retirer image {i}",
                     key=f"rm_img_{i}",
@@ -1466,7 +1652,13 @@ def _render_chat_interface() -> None:
             if not ALLOW_LARGE_FILES and size and size > MAX_FILE_BYTES:
                 oversized.append((upload.name, size))
                 continue
-            attachments.append({"name": upload.name, "data": upload.getvalue(), "size": size})
+            attachments.append(
+                {
+                    "name": upload.name,
+                    "size": size,
+                    "type": getattr(upload, "type", None),
+                }
+            )
 
         if oversized:
             st.warning(
@@ -1482,24 +1674,20 @@ def _render_chat_interface() -> None:
         image_stats: List[Dict[str, Any]] = []
         if st.session_state.chat_images:
             if len(st.session_state.chat_images) > MAX_IMAGE_ATTACHMENTS:
-                st.session_state.chat_images = st.session_state.chat_images[:MAX_IMAGE_ATTACHMENTS]
-            for f in list(st.session_state.chat_images):
-                try:
-                    image_parts.append(to_image_part(f))
-                    size = getattr(f, "size", None)
-                    if size is None:
-                        try:
-                            size = len(f.getvalue())
-                        except Exception:
-                            size = 0
-                    image_stats.append(
-                        {
-                            "name": getattr(f, "name", "Image"),
-                            "size_bytes": size or 0,
-                        }
-                    )
-                except Exception as exc:  # noqa: BLE001 - display in UI
-                    st.warning(f"Image ignorée ({f.name}) : {exc}")
+                st.session_state.chat_images = list(st.session_state.chat_images)[:MAX_IMAGE_ATTACHMENTS]
+            for entry in list(st.session_state.chat_images):
+                file_id = entry.get("file_id")
+                if not file_id:
+                    st.warning(f"Image ignorée ({entry.get('name', 'Image')}) : identifiant manquant.")
+                    continue
+                image_parts.append({"type": "input_image", "image_url": {"file_id": file_id}})
+                image_stats.append(
+                    {
+                        "name": entry.get("name", "Image"),
+                        "size_bytes": entry.get("size_bytes", 0),
+                        "file_id": file_id,
+                    }
+                )
 
         if not text_value and not attachments and not image_parts:
             st.info("Veuillez saisir un message ou ajouter des pièces jointes.")
@@ -1507,7 +1695,7 @@ def _render_chat_interface() -> None:
 
         selected_model = st.session_state.selected_model
         if image_parts and selected_model not in VISION_MODELS:
-            st.warning("Ce modèle n’accepte pas d’images, choisissez gpt-4o/mini/gpt-5.")
+            st.warning("Ce modèle n’accepte pas d’images. Choisissez gpt-5/gpt-5-mini/gpt-5.1/gpt-5.1-mini.")
             return
 
         if image_parts:
@@ -1545,33 +1733,6 @@ def _render_chat_interface() -> None:
                         unsafe_allow_html=True,
                     )
 
-        indexing_stats: Optional[Dict[str, Any]] = None
-        if attachments:
-            try:
-                with st.status("Indexation des pièces jointes…", expanded=False) as s:
-                    configure_status_callbacks(
-                        update=lambda label, state="running": s.update(label=label, state=state),
-                        write=s.write,
-                    )
-                    try:
-                        indexing_stats = index_files_from_chat(attachments)
-                    finally:
-                        clear_status_callbacks()
-                    if (indexing_stats or {}).get("chunks"):
-                        s.update(
-                            label=f"✅ Indexation terminée ({indexing_stats['chunks']} chunks)",
-                            state="complete",
-                        )
-                    else:
-                        s.update(label="⚠️ Aucun contenu indexable", state="error")
-            except Exception as error:  # noqa: BLE001 - surface in UI
-                st.error(f"Indexation impossible : {error}")
-                indexing_stats = None
-
-        if indexing_stats and indexing_stats.get("warnings"):
-            for warn in indexing_stats["warnings"]:
-                st.warning(warn)
-
         client = OpenAI(api_key=st.session_state.api_key)
         use_rag = _rag_is_ready()
         if not use_rag:
@@ -1591,6 +1752,17 @@ def _render_chat_interface() -> None:
                 st.session_state.rag_embedding_model or EMBEDDING_MODEL,
             )
 
+        _activate_pending_chat_documents(client)
+        try:
+            chat_doc_hits = _retrieve_chat_documents(
+                client,
+                query_for_rag,
+                k=st.session_state.get("rag_k", RAG_DEFAULTS["k"]),
+            )
+        except Exception as error:  # noqa: BLE001 - surface gracefully
+            st.warning(f"Contextes pièces jointes indisponibles : {error}")
+            chat_doc_hits = []
+
         if vectorstore is not None and not is_multimodal_request:
             base_cfg = effective_params_from_mode()
             active_cfg = base_cfg
@@ -1605,6 +1777,7 @@ def _render_chat_interface() -> None:
                     st.session_state.messages,
                     cfg=cfg,
                     context_token_budget=MAX_RAG_CONTEXT_TOKENS,
+                    additional_documents=chat_doc_hits,
                 )
 
             try:
@@ -1681,6 +1854,11 @@ def _render_chat_interface() -> None:
                 message_entry["render_options"] = render_opts
             st.session_state.messages.append(message_entry)
 
+            chat_source_count = sum(
+                1 for info in pipeline_sources_info if (info.get("meta") or {}).get("origin") == "chat"
+            )
+            rag_source_count = max(len(pipeline_sources_info) - chat_source_count, 0)
+
             call_context: Dict[str, Any] = {
                 "model": selected_model,
                 "call_type": "RAG Pipeline",
@@ -1693,7 +1871,8 @@ def _render_chat_interface() -> None:
                 "images": image_stats,
                 "attachments_count": len(attachments or []),
                 "rag_used": bool(pipeline_sources_info),
-                "rag_hits": len(pipeline_sources_info),
+                "rag_hits": rag_source_count,
+                "chat_hits": chat_source_count,
                 "sources_count": len(pipeline_sources_info),
                 "usage": usage_data,
                 "response_chars": len(final_text or ""),
@@ -1719,44 +1898,81 @@ def _render_chat_interface() -> None:
 
         sources_info: List[Dict[str, Any]] = []
 
-        hits: List[Any] = []
+        rag_documents: List[Document] = []
         if vectorstore is not None:
             try:
-                hits = _session_retrieve(vectorstore, query_for_rag, k=st.session_state.rag_k)
+                rag_documents = _session_retrieve(
+                    vectorstore,
+                    query_for_rag,
+                    k=st.session_state.rag_k,
+                )
             except Exception as error:  # noqa: BLE001 - surface gracefully
                 st.warning(f"Recherche contextuelle indisponible : {error}")
-                hits = []
+                rag_documents = []
+
+        rag_hits = _documents_to_hits(rag_documents)
+        chat_hits = _documents_to_hits(chat_doc_hits)
+        combined_hits = rag_hits + chat_hits
 
         truncated_context_flag = False
         truncated_history_flag = False
         selected_model = st.session_state.selected_model
 
-        if hits:
-            context, truncated_context_flag = format_context(
-                hits,
+        if combined_hits:
+            formatted_context, truncated_context_flag = format_context(
+                combined_hits,
                 model=selected_model,
                 max_tokens=MAX_RAG_CONTEXT_TOKENS,
             )
-            question_text = (_message_to_text(last_user_for_api) or "").strip() or (text_value or query_for_rag)
-            formatted_context = context or "(aucun extrait pertinent)"
-            sys_prefix = {
-                "role": "system",
-                "content": (
-                    "Tu es un assistant expert. Utilise prioritairement les passages suivants.\n\n"
-                    "CONTEXTE ISSU DE VOS FICHIERS :\n"
-                    "-------------------------------\n"
-                    f"{formatted_context}\n\n"
-                    "QUESTION UTILISATEUR :\n"
-                    "----------------------\n"
-                    f"{question_text}\n\n"
-                    "DIRECTIVES :\n"
-                    "1. Cite les sources au format [n] en fin de paragraphe.\n"
-                    "2. Si les documents ne répondent pas, écris explicitement \"Je ne sais pas\".\n"
-                    "3. Liste les sources exploitées à la fin de la réponse."
-                ),
-            }
-            messages_for_api = [sys_prefix] + messages_for_api
-            sources_info = _build_source_entries(hits)
+        else:
+            formatted_context = ""
+
+        last_user_for_prompt = next(
+            (msg for msg in reversed(messages_for_api) if msg.get("role") == "user"),
+            None,
+        )
+        question_text = (
+            (_message_to_text(last_user_for_prompt) or "").strip()
+            or (text_value or query_for_rag)
+        )
+
+        if question_text is None:
+            question_text = text_value or query_for_rag
+
+        if formatted_context:
+            instructions = (
+                "Tu es un assistant qui répond uniquement à partir des documents fournis dans le RAG et les pièces jointes du chat.\n"
+                "Ne dis jamais que tu ne peux pas lire les fichiers : ils ont déjà été analysés."
+            )
+            if chat_hits:
+                instructions += "\nPriorise aussi les extraits issus des pièces jointes du chat."
+            sys_prefix_content = (
+                f"{instructions}\n\n"
+                "CONTEXTE DISPONIBLE :\n"
+                "--------------------\n"
+                f"{formatted_context}\n\n"
+                "QUESTION UTILISATEUR :\n"
+                "----------------------\n"
+                f"{question_text}\n\n"
+                "DIRECTIVES :\n"
+                "1. Cite les sources au format [n] en fin de paragraphe.\n"
+                "2. Si les documents ne répondent pas, écris explicitement \"Je ne sais pas\".\n"
+                "3. Liste les sources exploitées à la fin de la réponse."
+            )
+        else:
+            sys_prefix_content = (
+                "Aucun document externe n'est disponible pour cette question. Réponds avec tes connaissances générales et fais-le savoir si nécessaire.\n\n"
+                "QUESTION UTILISATEUR :\n"
+                "----------------------\n"
+                f"{question_text}"
+            )
+
+        sys_prefix = {"role": "system", "content": sys_prefix_content}
+        messages_for_api = [sys_prefix] + messages_for_api
+        sources_info = _build_source_entries(combined_hits) if combined_hits else []
+
+        rag_hits_count = len(rag_hits)
+        chat_hits_count = len(chat_hits)
 
         original_prompt_tokens = count_tokens_chat(messages_for_api, selected_model)
         messages_for_api = truncate_messages_to_budget(
@@ -1785,8 +2001,9 @@ def _render_chat_interface() -> None:
             "image_count": len(image_stats),
             "images": image_stats,
             "attachments_count": len(attachments or []),
-            "rag_used": bool(hits),
-            "rag_hits": len(hits),
+            "rag_used": bool(rag_hits_count or chat_hits_count),
+            "rag_hits": rag_hits_count,
+            "chat_hits": chat_hits_count,
             "sources_count": len(sources_info),
             "usage": None,
             "temperature": st.session_state.gen_temperature,
@@ -1870,20 +2087,9 @@ def _render_chat_interface() -> None:
                 else:
                     st.info("Aucune réponse texte reçue.")
 
-                if hits:
-                    sources_placeholder.markdown(
-                        "Sources : "
-                        + " • ".join(
-                            [
-                                format_source_badge(hit[1], idx + 1)
-                                for idx, hit in enumerate(hits)
-                            ]
-                        )
-                    )
-                else:
-                    sources_line = _format_sources_line(sources_info)
-                    if sources_line:
-                        sources_placeholder.caption(sources_line)
+                sources_line = _format_sources_line(sources_info)
+                if sources_line:
+                    sources_placeholder.caption(sources_line)
 
                 usage_text = _format_usage(usage_holder["usage"])
                 if usage_text:

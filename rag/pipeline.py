@@ -111,6 +111,7 @@ def run_rag_pipeline(
     *,
     cfg: PerfConfig,
     context_token_budget: int = 20000,
+    additional_documents: Sequence[Document] | None = None,
 ) -> Dict[str, Any]:
     """Execute the RAG workflow using the provided performance configuration."""
 
@@ -128,6 +129,8 @@ def run_rag_pipeline(
 
     retrieval_start = time.perf_counter()
     docs = retrieve(vectorstore, query, k=cfg.rag_k, state=cfg)
+    if additional_documents:
+        docs = list(docs) + list(additional_documents)
     diagnostics["retrieval_time_s"] = round(time.perf_counter() - retrieval_start, 3)
     diagnostics["retrieved_docs"] = len(docs)
     diagnostics["rerank_used"] = bool(cfg.use_reranker and not cfg.use_mmr)
