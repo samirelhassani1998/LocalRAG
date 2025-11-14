@@ -110,10 +110,16 @@ def run_rag_pipeline(
     messages: Sequence[dict[str, Any]],
     *,
     cfg: PerfConfig,
+    context_token_budget: int = 20000,
 ) -> Dict[str, Any]:
     """Execute the RAG workflow using the provided performance configuration."""
 
-    diagnostics: Dict[str, Any] = {"model": model, "k": cfg.rag_k, "mode": "performance"}
+    diagnostics: Dict[str, Any] = {
+        "model": model,
+        "k": cfg.rag_k,
+        "mode": "quality",
+        "context_budget_tokens": context_token_budget,
+    }
 
     history_start = time.perf_counter()
     history_summary = summarize_history(client, model, messages)
@@ -126,7 +132,11 @@ def run_rag_pipeline(
     diagnostics["retrieved_docs"] = len(docs)
     diagnostics["rerank_used"] = bool(cfg.use_reranker and not cfg.use_mmr)
 
-    context, sources = build_context(docs)
+    context, sources = build_context(
+        docs,
+        max_tokens=context_token_budget,
+        model=model,
+    )
 
     system_prompt = SYSTEM_BASE
     user_prompt = USER_TEMPLATE.format(

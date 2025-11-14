@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Protocol, Sequence, Tuple
 
+from token_utils import count_tokens_text, truncate_context_text
+
 @dataclass
 class Document:
     """Simple container mimicking LangChain's Document interface."""
@@ -115,22 +117,51 @@ def retrieve(
     return reranked
 
 
-def build_context(docs: Iterable[Document], with_sources: bool = True) -> Tuple[str, List[Tuple[int, str]]]:
+def build_context(
+    docs: Iterable[Document],
+    with_sources: bool = True,
+    *,
+    max_tokens: int,
+    model: str,
+) -> Tuple[str, List[Tuple[int, str]]]:
     """Format retrieved documents into a numbered context block and collect sources."""
 
+    unique_docs: List[Tuple[str, dict[str, Any], float]] = []
+    seen: set[str] = set()
+    for doc in docs:
+        text = (getattr(doc, "page_content", "") or "").strip()
+        if not text:
+            continue
+        fingerprint = text.replace("\u00a0", " ").strip().lower()
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        metadata = dict(getattr(doc, "metadata", None) or {})
+        score = float(metadata.get("score", 0.0))
+        unique_docs.append((text, metadata, score))
+
+    sorted_docs = sorted(unique_docs, key=lambda item: item[2], reverse=True)
     context_lines: List[str] = []
     sources: List[Tuple[int, str]] = []
-    for i, doc in enumerate(docs, start=1):
-        metadata = getattr(doc, "metadata", None) or {}
-        context_lines.append(f"[{i}] {doc.page_content}")
-        source = (
-            metadata.get("source")
-            or metadata.get("file")
-            or metadata.get("path")
-            or metadata.get("name")
-            or f"doc_{i}"
-        )
-        sources.append((i, str(source)))
+    used_tokens = 0
+    for idx, (chunk, metadata, _score) in enumerate(sorted_docs, start=1):
+        descriptor = metadata.get("source") or metadata.get("file") or metadata.get("path") or metadata.get("name") or f"doc_{idx}"
+        if metadata.get("page") is not None:
+            descriptor = f"{descriptor} · page {metadata['page']}"
+        header = f"[{idx}] Source: {descriptor}\n"
+        header_tokens = count_tokens_text(header, model)
+        body_tokens = count_tokens_text(chunk, model)
+        if max_tokens > 0 and used_tokens + header_tokens + body_tokens > max_tokens:
+            remaining = max(max_tokens - used_tokens - header_tokens, 0)
+            truncated_chunk = truncate_context_text(chunk, model, remaining)
+            if truncated_chunk:
+                context_lines.append(header + truncated_chunk)
+                sources.append((idx, str(descriptor)))
+            break
+        context_lines.append(header + chunk)
+        used_tokens += header_tokens + body_tokens
+        sources.append((idx, str(descriptor)))
+
     return "\n\n".join(context_lines), sources if with_sources else []
 
 

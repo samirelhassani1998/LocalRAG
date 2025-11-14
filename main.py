@@ -30,7 +30,6 @@ from rag_utils import (
 )
 from token_utils import (
     count_tokens_chat,
-    truncate_context_text,
     truncate_messages_to_budget,
 )
 from utils.rendering import extract_code_block, try_extract_dbml_heuristic
@@ -43,41 +42,8 @@ load_dotenv()
 
 st.set_page_config(page_title="ChatGPT-like Chatbot", layout="wide")
 
-
-def _init_perf_state() -> None:
-    """Initialize high-performance defaults once per session."""
-
-    st.session_state.setdefault("selected_model", "gpt-4o-mini")
-
-    # RAG performance tuning
-    st.session_state.setdefault("rag_k", 4)
-    st.session_state.setdefault("use_mmr", True)
-    st.session_state.setdefault("mmr_fetch_k", 24)
-    st.session_state.setdefault("mmr_lambda", 0.5)
-
-    # No reranker / multipass in perf mode
-    st.session_state.setdefault("use_reranker", False)
-    st.session_state.setdefault("use_multipass", False)
-
-    # Generation parameters tuned for speed
-    st.session_state.setdefault("gen_temperature", 0.6)
-    st.session_state.setdefault("gen_top_p", 0.9)
-    st.session_state.setdefault("gen_max_tokens", 900)
-    st.session_state.setdefault("gen_streaming", True)
-
-    st.session_state.setdefault("mode", "performance")
-    st.session_state.setdefault("quality_escalated", False)
-
-
-_init_perf_state()
-
-if "app_config" not in st.session_state:
-    base_cfg = PerfConfig()
-    if os.getenv("QUALITY_ESCALATION", "0") == "1":
-        base_cfg = PerfConfig(quality_escalation=True)
-    st.session_state.app_config = base_cfg
-
-CFG: PerfConfig = st.session_state.app_config
+QUALITY_ESCALATION_ENABLED = os.getenv("QUALITY_ESCALATION", "1") != "0"
+CFG: PerfConfig = PerfConfig(quality_escalation=QUALITY_ESCALATION_ENABLED)
 
 AVAILABLE_MODELS = [
     "gpt-4o",
@@ -105,6 +71,23 @@ SIDEBAR_UPLOAD_KEY = "sidebar_uploaded_files"
 CHAT_FILE_UPLOAD_KEY = "chat_file_uploader"
 CHAT_IMAGE_UPLOAD_KEY = "chat_image_uploader"
 
+RAG_DEFAULTS = {
+    "k": CFG.rag_k,
+    "use_mmr": CFG.use_mmr,
+    "mmr_fetch_k": CFG.mmr_fetch_k,
+    "mmr_lambda": CFG.mmr_lambda,
+    "use_reranker": CFG.use_reranker,
+    "multi_pass": CFG.use_multipass,
+    "embedding_model": EMBEDDING_MODEL,
+}
+
+GENERATION_DEFAULTS = {
+    "temperature": CFG.temperature,
+    "top_p": CFG.top_p,
+    "max_tokens": CFG.max_tokens,
+    "streaming": CFG.streaming,
+}
+
 
 try:  # pragma: no cover - optional dependency check
     import torch  # type: ignore
@@ -114,17 +97,8 @@ else:  # pragma: no cover - torch present
     TORCH_AVAILABLE = True
 
 
-DEFAULT_RETRIEVAL_K = 8
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_TOP_P = 0.95
-DEFAULT_MAX_TOKENS = 2000
 MAX_TOKENS_MIN = 512
 MAX_TOKENS_MAX = 8192
-
-PERFORMANCE_DEFAULT_K = 4
-PERFORMANCE_DEFAULT_MAX_TOKENS = 900
-PERFORMANCE_DEFAULT_TEMPERATURE = 0.6
-PERFORMANCE_DEFAULT_TOP_P = 0.9
 
 
 BASE_GLOBAL_SYSTEM_PROMPT = (
@@ -177,7 +151,7 @@ def with_quality_boost(params: PerfConfig) -> PerfConfig:
         use_multipass=True,
         use_reranker=True,
         max_tokens=max(params.max_tokens, 2000),
-        temperature=max(params.temperature, 0.7),
+        temperature=min(params.temperature, 0.4),
         top_p=max(params.top_p, 0.95),
     )
 
@@ -208,29 +182,48 @@ def is_org_verify_stream_error(e: Exception) -> bool:
 
 
 def _init_session_state() -> None:
-    env_key = os.getenv("OPENAI_API_KEY")
-    st.session_state.setdefault("api_key", env_key if env_key else None)
-    st.session_state.setdefault("messages", [dict(GLOBAL_SYSTEM_MESSAGE)])
-    st.session_state.setdefault("selected_model", CFG.default_model)
-    st.session_state.setdefault("rag_index", None)
-    st.session_state.setdefault("rag_texts", [])
-    st.session_state.setdefault("rag_meta", [])
-    st.session_state.setdefault("rag_docs", [])
-    st.session_state.setdefault("rag_embedding_model", EMBEDDING_MODEL)
-    st.session_state.setdefault("rag_diagnostics", None)
-    st.session_state.setdefault("chat_attachments", [])
-    st.session_state.setdefault("chat_images", [])
-    st.session_state.setdefault("show_logs", False)
-    st.session_state.setdefault("last_call_log", None)
-    st.session_state.setdefault("_sidebar_feedback", None)
-    st.session_state.setdefault("_chat_file_warning", [])
-    st.session_state.setdefault("_chat_image_warning", [])
-    st.session_state.setdefault("_pending_rag_reset", False)
-    st.session_state.setdefault("_pending_rag_index", False)
-    st.session_state.setdefault("_pending_chat_submit", None)
-    st.session_state.setdefault(SIDEBAR_UPLOAD_KEY, [])
-    st.session_state.setdefault(CHAT_FILE_UPLOAD_KEY, [])
-    st.session_state.setdefault(CHAT_IMAGE_UPLOAD_KEY, [])
+    """Populate ``st.session_state`` with all keys used across the UI."""
+
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    defaults = {
+        "api_key": env_key or None,
+        "messages": [dict(GLOBAL_SYSTEM_MESSAGE)],
+        "selected_model": CFG.default_model,
+        "rag_index": None,
+        "rag_texts": [],
+        "rag_meta": [],
+        "rag_docs": [],
+        "rag_embedding_model": RAG_DEFAULTS["embedding_model"],
+        "rag_diagnostics": None,
+        "rag_k": RAG_DEFAULTS["k"],
+        "use_mmr": RAG_DEFAULTS["use_mmr"],
+        "mmr_fetch_k": RAG_DEFAULTS["mmr_fetch_k"],
+        "mmr_lambda": RAG_DEFAULTS["mmr_lambda"],
+        "use_reranker": RAG_DEFAULTS["use_reranker"],
+        "use_multipass": RAG_DEFAULTS["multi_pass"],
+        "gen_temperature": GENERATION_DEFAULTS["temperature"],
+        "gen_top_p": GENERATION_DEFAULTS["top_p"],
+        "gen_max_tokens": GENERATION_DEFAULTS["max_tokens"],
+        "gen_streaming": GENERATION_DEFAULTS["streaming"],
+        "quality_escalated": False,
+        "chat_attachments": [],
+        "chat_images": [],
+        "show_logs": False,
+        "last_call_log": None,
+        "_sidebar_feedback": None,
+        "_chat_file_warning": [],
+        "_chat_image_warning": [],
+        "_pending_rag_reset": False,
+        "_pending_rag_index": False,
+        "_pending_chat_submit": None,
+        SIDEBAR_UPLOAD_KEY: [],
+        CHAT_FILE_UPLOAD_KEY: [],
+        CHAT_IMAGE_UPLOAD_KEY: [],
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
 def _reset_chat() -> None:
@@ -264,6 +257,8 @@ def _request_indexing() -> None:
 
 
 def _process_pending_actions() -> None:
+    """Handle deferred sidebar actions (index/reset) safely."""
+
     feedback: Optional[tuple[str, str]] = None
 
     st.session_state["_sidebar_feedback"] = None
@@ -281,11 +276,6 @@ def _process_pending_actions() -> None:
 
     if feedback is not None:
         st.session_state["_sidebar_feedback"] = feedback
-
-
-def set_defaults_if_needed(*, force: bool = False) -> None:
-    _ = force
-    _init_perf_state()
 
 
 def _rag_is_ready() -> bool:
@@ -309,36 +299,40 @@ class SessionVectorStore:
         self._metas = list(metas or [])
         self._embedding_model = embedding_model or EMBEDDING_MODEL
 
-    def similarity_search(self, query: str, k: int = 8) -> List[Document]:
+    def similarity_search(self, query: str, k: int = CFG.rag_k) -> List[Document]:
         if self._index is None or not self._texts:
             return []
         query_embedding = embed_texts(self._client, self._embedding_model, [query])
         if getattr(query_embedding, "size", 0) == 0:
             return []
-        limit = min(k, len(self._texts))
-        if limit <= 0:
+        target = min(k, len(self._texts))
+        if target <= 0:
             return []
-        _distances, indices = self._index.search(query_embedding, limit)
+        search_limit = min(max(target * 3, target), len(self._texts))
+        distances, indices = self._index.search(query_embedding, search_limit)
         documents: List[Document] = []
         seen: set[int] = set()
-        for idx in indices[0]:
+        for distance, idx in zip(distances[0], indices[0]):
             if idx < 0 or idx >= len(self._texts) or idx in seen:
                 continue
             seen.add(int(idx))
+            meta = dict(self._metas[idx] or {})
+            similarity = 1.0 / (1.0 + float(distance)) if distance is not None else 0.0
+            meta.setdefault("score", similarity)
             documents.append(
                 Document(
                     page_content=self._texts[idx],
-                    metadata=dict(self._metas[idx] or {}),
+                    metadata=meta,
                 )
             )
-            if len(documents) >= limit:
+            if len(documents) >= target:
                 break
         return documents
 
     def max_marginal_relevance_search(
         self,
         query: str,
-        k: int = PERFORMANCE_DEFAULT_K,
+        k: int = CFG.rag_k,
         fetch_k: int = 24,
         lambda_mult: float = 0.5,
     ) -> List[Document]:
@@ -365,10 +359,11 @@ def _build_source_entries(hits: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]
 
 def _session_retrieve(vectorstore: SessionVectorStore, query: str, *, k: Optional[int] = None) -> List[Document]:
     state = st.session_state
-    top_k = int(k or state.get("rag_k", PERFORMANCE_DEFAULT_K))
-    if state.get("use_mmr", True):
-        fetch_k = max(int(state.get("mmr_fetch_k", 24)), top_k * 6)
-        lambda_mult = float(state.get("mmr_lambda", 0.5))
+    top_k = int(k or state.get("rag_k", RAG_DEFAULTS["k"]))
+    use_mmr = bool(state.get("use_mmr", RAG_DEFAULTS["use_mmr"]))
+    if use_mmr:
+        fetch_k = max(int(state.get("mmr_fetch_k", RAG_DEFAULTS["mmr_fetch_k"])), top_k * 6)
+        lambda_mult = float(state.get("mmr_lambda", RAG_DEFAULTS["mmr_lambda"]))
         try:
             return vectorstore.max_marginal_relevance_search(
                 query,
@@ -382,6 +377,8 @@ def _session_retrieve(vectorstore: SessionVectorStore, query: str, *, k: Optiona
 
 
 def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
+    """Ingest uploaded files and update the in-memory vector index."""
+
     if not uploaded_files:
         return
 
@@ -491,6 +488,8 @@ def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
 
 
 def _add_chat_attachments() -> None:
+    """Persist uploaded files as pending chat attachments."""
+
     files = st.session_state.get(CHAT_FILE_UPLOAD_KEY) or []
     attachments = list(st.session_state.get("chat_attachments", []))
     existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in attachments}
@@ -520,10 +519,11 @@ def _add_chat_attachments() -> None:
     st.session_state.chat_attachments = attachments
     st.session_state["_chat_file_warning"] = warnings
     st.session_state[CHAT_FILE_UPLOAD_KEY] = []
-    st.rerun()
 
 
 def _add_chat_images() -> None:
+    """Persist uploaded images as pending chat attachments."""
+
     files = st.session_state.get(CHAT_IMAGE_UPLOAD_KEY) or []
     images = list(st.session_state.get("chat_images", []))
     existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in images}
@@ -542,7 +542,15 @@ def _add_chat_images() -> None:
     st.session_state.chat_images = images
     st.session_state["_chat_image_warning"] = warnings
     st.session_state[CHAT_IMAGE_UPLOAD_KEY] = []
-    st.rerun()
+
+
+def _consume_pending_chat_uploads() -> None:
+    """Process uploader buffers after the form is rendered."""
+
+    if st.session_state.get(CHAT_FILE_UPLOAD_KEY):
+        _add_chat_attachments()
+    if st.session_state.get(CHAT_IMAGE_UPLOAD_KEY):
+        _add_chat_images()
 
 
 def _remove_chat_attachment(index: int) -> None:
@@ -562,6 +570,8 @@ def _remove_chat_image(index: int) -> None:
 
 
 def _render_key_gate() -> None:
+    """Ask for an API key before unlocking the chat interface."""
+
     st.markdown(
         """
         <style>
@@ -617,6 +627,8 @@ def _render_key_gate() -> None:
 
 
 def _render_sidebar() -> None:
+    """Render the left sidebar with model switcher and RAG utilities."""
+
     with st.sidebar:
         st.markdown("### Paramètres")
         try:
@@ -630,7 +642,7 @@ def _render_sidebar() -> None:
 
         st.markdown("---")
         st.caption("Votre clé n'est jamais sauvegardée côté serveur.")
-        st.caption("⚡ Mode performance activé (réglages masqués).")
+        st.caption("🧠 Mode qualité optimisé (réglages masqués).")
 
         st.markdown("### Données")
         st.file_uploader(
@@ -831,6 +843,27 @@ def _format_usage(usage: Optional[Dict[str, int]]) -> Optional[str]:
         return None
 
     return "Usage tokens — " + ", ".join(parts)
+
+
+def _message_to_text(message: Optional[Dict[str, Any]]) -> str:
+    """Return the textual portion of a chat message (ignoring images)."""
+
+    if not message:
+        return ""
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_value = item.get("text")
+                if isinstance(text_value, str):
+                    parts.append(text_value)
+        return "\n".join(part for part in parts if part).strip()
+    if content is None:
+        return ""
+    return str(content)
 
 
 def responses_stream(
@@ -1153,6 +1186,8 @@ def _render_message_content(
 
 
 def _render_chat_interface() -> None:
+    """Display the full conversational UI including history and composer."""
+
     _ensure_global_system_message()
     st.session_state["_render_counter"] = 0
 
@@ -1315,7 +1350,6 @@ def _render_chat_interface() -> None:
                     ],
                     accept_multiple_files=True,
                     key=CHAT_FILE_UPLOAD_KEY,
-                    on_change=_add_chat_attachments,
                 )
                 help_hint = (
                     f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
@@ -1329,7 +1363,6 @@ def _render_chat_interface() -> None:
                     type=["png", "jpg", "jpeg", "webp", "gif"],
                     accept_multiple_files=True,
                     key=CHAT_IMAGE_UPLOAD_KEY,
-                    on_change=_add_chat_images,
                 )
 
         with c2:
@@ -1341,6 +1374,8 @@ def _render_chat_interface() -> None:
 
         with c3:
             send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
+
+    _consume_pending_chat_uploads()
 
     for warning in st.session_state.get("_chat_file_warning", []) or []:
         st.warning(warning)
@@ -1533,6 +1568,7 @@ def _render_chat_interface() -> None:
                     query_for_rag,
                     st.session_state.messages,
                     cfg=cfg,
+                    context_token_budget=MAX_RAG_CONTEXT_TOKENS,
                 )
 
             try:
@@ -1633,7 +1669,7 @@ def _render_chat_interface() -> None:
                 "rag_k": active_cfg.rag_k,
                 "multipass": active_cfg.use_multipass,
                 "rerank": active_cfg.use_reranker,
-                "mode": "performance",
+                "mode": "quality",
             }
             st.session_state.last_call_log = call_context
             return
@@ -1660,19 +1696,27 @@ def _render_chat_interface() -> None:
         selected_model = st.session_state.selected_model
 
         if hits:
-            context = format_context(hits)
-            trimmed_context = truncate_context_text(
-                context,
-                selected_model,
-                MAX_RAG_CONTEXT_TOKENS,
+            context, truncated_context_flag = format_context(
+                hits,
+                model=selected_model,
+                max_tokens=MAX_RAG_CONTEXT_TOKENS,
             )
-            truncated_context_flag = trimmed_context != context
+            question_text = (_message_to_text(last_user_for_api) or "").strip() or (text_value or query_for_rag)
+            formatted_context = context or "(aucun extrait pertinent)"
             sys_prefix = {
                 "role": "system",
                 "content": (
-                    "Tu es un assistant. Utilise EXCLUSIVEMENT les extraits ci-dessous pour répondre. "
-                    "Cites les sources entre crochets [n]. Si l’info manque, dis-le.\n\nExtraits :\n"
-                    + trimmed_context
+                    "Tu es un assistant expert. Utilise prioritairement les passages suivants.\n\n"
+                    "CONTEXTE ISSU DE VOS FICHIERS :\n"
+                    "-------------------------------\n"
+                    f"{formatted_context}\n\n"
+                    "QUESTION UTILISATEUR :\n"
+                    "----------------------\n"
+                    f"{question_text}\n\n"
+                    "DIRECTIVES :\n"
+                    "1. Cite les sources au format [n] en fin de paragraphe.\n"
+                    "2. Si les documents ne répondent pas, écris explicitement \"Je ne sais pas\".\n"
+                    "3. Liste les sources exploitées à la fin de la réponse."
                 ),
             }
             messages_for_api = [sys_prefix] + messages_for_api
@@ -1873,7 +1917,6 @@ def _render_chat_interface() -> None:
 
 if __name__ == "__main__":
     _init_session_state()
-    set_defaults_if_needed()
     _process_pending_actions()
 
     if not st.session_state.api_key:
