@@ -37,6 +37,10 @@ Open the provided local URL in your browser. The app will first ask for your API
 
 If you do not want to type your API key every time, you can create a `.env` file at the project root and set `OPENAI_API_KEY=...`. The app will load it automatically on startup, but the key can still be changed from the UI at any time.
 
+Additional knobs for advanced usage:
+
+- `QUALITY_ESCALATION=0` — disables the automatic multi-pass / reranker escalation (enabled by default for maximum quality).
+
 ## Customization
 
 - Update the list of models in `main.py` to match the ones available on your account.
@@ -49,8 +53,10 @@ The chat interface now includes an optional retrieval-augmented generation (RAG)
 - **Drag & drop documents** directly in the sidebar (`csv`, `xlsx`, `xls`, `pdf`, `docx`, `txt`, `md`). Up to five files can be indexed at a time and the per-file limit defaults to 20&nbsp;MB (configurable).
 - **On-demand indexing** builds an in-memory FAISS index for the current session using OpenAI's `text-embedding-3-large` model. Files are read in memory only; nothing is persisted on disk and the API key never leaves the session.
 - **Chunking & metadata**: each document is normalized, chunked (~4 000 chars with 400-char overlap), and enriched with metadata (source file, page/sheet/row range when applicable).
-- **Contextual answers**: when the index is populated, every new user question retrieves the top-4 chunks and injects them into the system prompt. Responses cite their sources and a badge indicates when RAG is active.
+- **Contextual answers**: when the index is populated, every new user question retrieves the top-8 chunks (MMR + reranker) and injects them into the system prompt. Responses cite their sources and a badge indicates when RAG is active.
 - **Reset anytime**: use the “Réinitialiser base” button to clear the FAISS index and associated documents from the session state.
+
+By default the chatbot now runs in "mode qualité" with aggressive retrieval settings (`k=8`, MMR fetch 40, cross-encoder reranking, multi-pass generation and 2 000 output tokens). Those options are baked into the code for maximum robustness and no longer appear in the sidebar.
 
 The sidebar summarises the indexed corpus (file sizes, estimated tokens, chunk counts, embedding model). If a PDF contains no extractable text (e.g. scanned documents), the app warns you and skips it.
 

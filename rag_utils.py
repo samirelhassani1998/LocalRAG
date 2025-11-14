@@ -1116,13 +1116,36 @@ def retrieve(
     for score, idx in zip(distances[0], indices[0]):
         if idx < 0 or idx >= len(texts):
             continue
-        hits.append((texts[idx], metas[idx], float(score)))
+        similarity = 1.0 / (1.0 + float(score)) if score is not None else 0.0
+        hits.append((texts[idx], metas[idx], similarity))
     return hits
 
 
-def format_context(hits: Iterable[Tuple[str, Dict[str, Any], float]]) -> str:
+def format_context(
+    hits: Iterable[Tuple[str, Dict[str, Any], float]],
+    *,
+    model: str,
+    max_tokens: int,
+) -> Tuple[str, bool]:
+    """Format RAG hits with deduplication and token-aware truncation."""
+
+    unique_entries: List[Tuple[str, Dict[str, Any], float]] = []
+    seen_chunks: set[str] = set()
+    for chunk, meta, similarity in hits:
+        text = (chunk or "").strip()
+        if not text:
+            continue
+        fingerprint = text.replace("\u00a0", " ").strip().lower()
+        if fingerprint in seen_chunks:
+            continue
+        seen_chunks.add(fingerprint)
+        unique_entries.append((text, meta or {}, float(similarity or 0.0)))
+
+    sorted_entries = sorted(unique_entries, key=lambda item: item[2], reverse=True)
     sections: List[str] = []
-    for pos, (chunk, meta, _) in enumerate(hits, start=1):
+    used_tokens = 0
+    truncated = False
+    for pos, (chunk, meta, _similarity) in enumerate(sorted_entries, start=1):
         descriptor_parts = [meta.get("source", "inconnu")]
         if meta.get("page") is not None:
             descriptor_parts.append(f"page {meta['page']}")
@@ -1131,8 +1154,20 @@ def format_context(hits: Iterable[Tuple[str, Dict[str, Any], float]]) -> str:
         if meta.get("row_range"):
             descriptor_parts.append(f"lignes {meta['row_range']}")
         descriptor = " ".join(descriptor_parts)
-        sections.append(f"[{pos}] Source: {descriptor}\n{chunk}")
-    return "\n\n".join(sections)
+        header = f"[{pos}] Source: {descriptor}\n"
+        header_tokens = count_tokens_text(header, model)
+        body_tokens = count_tokens_text(chunk, model)
+        if max_tokens > 0 and used_tokens + header_tokens + body_tokens > max_tokens:
+            remaining = max(max_tokens - used_tokens - header_tokens, 0)
+            truncated_chunk = truncate_context_text(chunk, model, remaining)
+            if truncated_chunk:
+                sections.append(header + truncated_chunk)
+                truncated = True
+            break
+        sections.append(header + chunk)
+        used_tokens += header_tokens + body_tokens
+
+    return "\n\n".join(sections), truncated
 
 
 def format_source_badge(meta: Dict[str, Any], index: int) -> str:

@@ -3,22 +3,24 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class PerfConfig:
+    """Container describing the Retrieval-Augmented Generation defaults."""
+
     # Modèle
-    default_model: str = "gpt-4o-mini"
+    default_model: str = "gpt-4o"
 
     # RAG
-    rag_k: int = 4
+    rag_k: int = 8
     use_mmr: bool = True
-    mmr_fetch_k: int = 24
-    mmr_lambda: float = 0.5
-    use_reranker: bool = False
-    use_multipass: bool = False
+    mmr_fetch_k: int = 40
+    mmr_lambda: float = 0.35
+    use_reranker: bool = True
+    use_multipass: bool = True
 
     # Génération
-    temperature: float = 0.6
-    top_p: float = 0.9
-    max_tokens: int = 900
+    temperature: float = 0.3
+    top_p: float = 0.95
+    max_tokens: int = 2000
     streaming: bool = True
 
-    # Quality escalation (désactivée par défaut)
-    quality_escalation: bool = False
+    # Quality escalation (activée par défaut)
+    quality_escalation: bool = True
