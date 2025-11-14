@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from dataclasses import replace
 
 import streamlit as st
+from streamlit.runtime.uploaded_file_manager import UploadedFile
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -213,12 +214,12 @@ def _init_session_state() -> None:
         "_sidebar_feedback": None,
         "_chat_file_warning": [],
         "_chat_image_warning": [],
+        "_chat_file_uploader_epoch": 0,
+        "_chat_image_uploader_epoch": 0,
         "_pending_rag_reset": False,
         "_pending_rag_index": False,
         "_pending_chat_submit": None,
         SIDEBAR_UPLOAD_KEY: [],
-        CHAT_FILE_UPLOAD_KEY: [],
-        CHAT_IMAGE_UPLOAD_KEY: [],
     }
 
     for key, value in defaults.items():
@@ -487,15 +488,41 @@ def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
         st.warning(warn)
 
 
-def _add_chat_attachments() -> None:
+def _chat_file_uploader_key() -> str:
+    return f"{CHAT_FILE_UPLOAD_KEY}_{st.session_state.get('_chat_file_uploader_epoch', 0)}"
+
+
+def _chat_image_uploader_key() -> str:
+    return f"{CHAT_IMAGE_UPLOAD_KEY}_{st.session_state.get('_chat_image_uploader_epoch', 0)}"
+
+
+def _reset_chat_file_uploader_widget() -> None:
+    st.session_state["_chat_file_uploader_epoch"] = (
+        st.session_state.get("_chat_file_uploader_epoch", 0) + 1
+    )
+
+
+def _reset_chat_image_uploader_widget() -> None:
+    st.session_state["_chat_image_uploader_epoch"] = (
+        st.session_state.get("_chat_image_uploader_epoch", 0) + 1
+    )
+
+
+def _add_chat_attachments(files: Optional[Sequence[UploadedFile]]) -> None:
     """Persist uploaded files as pending chat attachments."""
 
-    files = st.session_state.get(CHAT_FILE_UPLOAD_KEY) or []
+    if not files:
+        return
+
     attachments = list(st.session_state.get("chat_attachments", []))
     existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in attachments}
     warnings: List[str] = []
+    processed = False
 
     for upload in files:
+        if upload is None:
+            continue
+        processed = True
         key = (getattr(upload, "name", None), getattr(upload, "size", None))
         if key in existing:
             continue
@@ -516,20 +543,27 @@ def _add_chat_attachments() -> None:
         attachments.append(upload)
         existing.add(key)
 
-    st.session_state.chat_attachments = attachments
-    st.session_state["_chat_file_warning"] = warnings
-    st.session_state[CHAT_FILE_UPLOAD_KEY] = []
+    if processed:
+        st.session_state.chat_attachments = attachments
+        st.session_state["_chat_file_warning"] = warnings
+        _reset_chat_file_uploader_widget()
 
 
-def _add_chat_images() -> None:
+def _add_chat_images(files: Optional[Sequence[UploadedFile]]) -> None:
     """Persist uploaded images as pending chat attachments."""
 
-    files = st.session_state.get(CHAT_IMAGE_UPLOAD_KEY) or []
+    if not files:
+        return
+
     images = list(st.session_state.get("chat_images", []))
     existing = {(getattr(f, "name", None), getattr(f, "size", None)) for f in images}
     warnings: List[str] = []
+    processed = False
 
     for upload in files:
+        if upload is None:
+            continue
+        processed = True
         key = (getattr(upload, "name", None), getattr(upload, "size", None))
         if key in existing:
             continue
@@ -539,20 +573,10 @@ def _add_chat_images() -> None:
         images.append(upload)
         existing.add(key)
 
-    st.session_state.chat_images = images
-    st.session_state["_chat_image_warning"] = warnings
-    st.session_state[CHAT_IMAGE_UPLOAD_KEY] = []
-
-
-def _consume_pending_chat_uploads() -> None:
-    """Process uploader buffers after the form is rendered."""
-
-    if st.session_state.get(CHAT_FILE_UPLOAD_KEY):
-        _add_chat_attachments()
-        st.session_state[CHAT_FILE_UPLOAD_KEY] = []
-    if st.session_state.get(CHAT_IMAGE_UPLOAD_KEY):
-        _add_chat_images()
-        st.session_state[CHAT_IMAGE_UPLOAD_KEY] = []
+    if processed:
+        st.session_state.chat_images = images
+        st.session_state["_chat_image_warning"] = warnings
+        _reset_chat_image_uploader_widget()
 
 
 def _remove_chat_attachment(index: int) -> None:
@@ -1335,12 +1359,12 @@ def _render_chat_interface() -> None:
             unsafe_allow_html=True,
         )
 
+    chat_files: Optional[Sequence[UploadedFile]] = None
+    chat_images: Optional[Sequence[UploadedFile]] = None
     uploads_col, composer_col = st.columns([0.1, 0.9])
     with uploads_col:
         with st.popover("📎", use_container_width=True):
-            # Les uploaders sont rendus hors du formulaire pour respecter la règle Streamlit
-            # (pas de callbacks dans un st.form) tout en gardant l'ajout immédiat des fichiers.
-            st.file_uploader(
+            chat_files = st.file_uploader(
                 "Importer des fichiers",
                 type=[
                     "csv",
@@ -1355,7 +1379,7 @@ def _render_chat_interface() -> None:
                     "ndjson",
                 ],
                 accept_multiple_files=True,
-                key=CHAT_FILE_UPLOAD_KEY,
+                key=_chat_file_uploader_key(),
             )
             help_hint = (
                 f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
@@ -1364,11 +1388,11 @@ def _render_chat_interface() -> None:
                 help_hint += " — Les fichiers plus lourds seront traités par morceaux."
             st.caption(help_hint)
 
-            st.file_uploader(
+            chat_images = st.file_uploader(
                 "Images (PNG, JPG, WEBP, GIF)",
                 type=["png", "jpg", "jpeg", "webp", "gif"],
                 accept_multiple_files=True,
-                key=CHAT_IMAGE_UPLOAD_KEY,
+                key=_chat_image_uploader_key(),
             )
 
     send = False
@@ -1386,7 +1410,8 @@ def _render_chat_interface() -> None:
             with send_col:
                 send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
 
-    _consume_pending_chat_uploads()
+    _add_chat_attachments(chat_files)
+    _add_chat_images(chat_images)
 
     for warning in st.session_state.get("_chat_file_warning", []) or []:
         st.warning(warning)
