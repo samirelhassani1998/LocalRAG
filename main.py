@@ -1335,49 +1335,56 @@ def _render_chat_interface() -> None:
             unsafe_allow_html=True,
         )
 
-    with st.form("chat-composer", clear_on_submit=True):
-        c1, c2, c3 = st.columns([0.08, 0.72, 0.20])
-        with c1:
-            with st.popover("📎", use_container_width=True):
-                st.file_uploader(
-                    "Importer des fichiers",
-                    type=[
-                        "csv",
-                        "tsv",
-                        "xlsx",
-                        "xls",
-                        "pdf",
-                        "docx",
-                        "txt",
-                        "md",
-                        "json",
-                    ],
-                    accept_multiple_files=True,
-                    key=CHAT_FILE_UPLOAD_KEY,
-                )
-                help_hint = (
-                    f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
-                )
-                if ALLOW_LARGE_FILES:
-                    help_hint += " — Les fichiers plus lourds seront traités par morceaux."
-                st.caption(help_hint)
+    uploads_col, composer_col = st.columns([0.1, 0.9])
+    with uploads_col:
+        with st.popover("📎", use_container_width=True):
+            # Les uploaders sont rendus hors du formulaire pour respecter la règle Streamlit
+            # (pas de callbacks dans un st.form) tout en gardant l'ajout immédiat des fichiers.
+            st.file_uploader(
+                "Importer des fichiers",
+                type=[
+                    "csv",
+                    "tsv",
+                    "xlsx",
+                    "xls",
+                    "pdf",
+                    "docx",
+                    "txt",
+                    "md",
+                    "json",
+                    "ndjson",
+                ],
+                accept_multiple_files=True,
+                key=CHAT_FILE_UPLOAD_KEY,
+            )
+            help_hint = (
+                f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
+            )
+            if ALLOW_LARGE_FILES:
+                help_hint += " — Les fichiers plus lourds seront traités par morceaux."
+            st.caption(help_hint)
 
-                st.file_uploader(
-                    "Images (PNG, JPG, WEBP, GIF)",
-                    type=["png", "jpg", "jpeg", "webp", "gif"],
-                    accept_multiple_files=True,
-                    key=CHAT_IMAGE_UPLOAD_KEY,
-                )
-
-        with c2:
-            user_text = st.text_input(
-                "Envoyer un message…",
-                label_visibility="collapsed",
-                key="chat_input",
+            st.file_uploader(
+                "Images (PNG, JPG, WEBP, GIF)",
+                type=["png", "jpg", "jpeg", "webp", "gif"],
+                accept_multiple_files=True,
+                key=CHAT_IMAGE_UPLOAD_KEY,
             )
 
-        with c3:
-            send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
+    send = False
+    user_text = ""
+    with composer_col:
+        # Seul le champ texte et le bouton restent dans le formulaire avec le submit explicite.
+        with st.form("chat-composer", clear_on_submit=True):
+            text_col, send_col = st.columns([0.75, 0.25])
+            with text_col:
+                user_text = st.text_input(
+                    "Envoyer un message…",
+                    label_visibility="collapsed",
+                    key="chat_input",
+                )
+            with send_col:
+                send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
 
     _consume_pending_chat_uploads()
 
