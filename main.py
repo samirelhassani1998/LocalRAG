@@ -549,8 +549,10 @@ def _consume_pending_chat_uploads() -> None:
 
     if st.session_state.get(CHAT_FILE_UPLOAD_KEY):
         _add_chat_attachments()
+        st.session_state[CHAT_FILE_UPLOAD_KEY] = []
     if st.session_state.get(CHAT_IMAGE_UPLOAD_KEY):
         _add_chat_images()
+        st.session_state[CHAT_IMAGE_UPLOAD_KEY] = []
 
 
 def _remove_chat_attachment(index: int) -> None:
