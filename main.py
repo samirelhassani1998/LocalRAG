@@ -647,36 +647,38 @@ def _render_sidebar() -> None:
         st.caption("🧠 Mode qualité optimisé (réglages masqués).")
 
         st.markdown("### Données")
-        st.file_uploader(
-            "📎 Importer des fichiers",
-            type=[
-                "csv",
-                "tsv",
-                "xlsx",
-                "xls",
-                "pdf",
-                "docx",
-                "txt",
-                "md",
-                "json",
-            ],
-            accept_multiple_files=True,
-            key=SIDEBAR_UPLOAD_KEY,
-        )
-        help_hint = (
-            f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
-        )
-        if ALLOW_LARGE_FILES:
-            help_hint += " — Les fichiers plus lourds seront traités par morceaux."
-        st.caption(help_hint)
+        with st.form("sidebar-upload-form", clear_on_submit=False):
+            uploaded_files = st.file_uploader(
+                "📎 Importer des fichiers",
+                type=[
+                    "csv",
+                    "tsv",
+                    "xlsx",
+                    "xls",
+                    "pdf",
+                    "docx",
+                    "txt",
+                    "md",
+                    "json",
+                    "ndjson",
+                ],
+                accept_multiple_files=True,
+                key=SIDEBAR_UPLOAD_KEY,
+            )
+            help_hint = (
+                f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
+            )
+            if ALLOW_LARGE_FILES:
+                help_hint += " — Les fichiers plus lourds seront traités par morceaux."
+            st.caption(help_hint)
+            index_button = st.form_submit_button(
+                "Indexer",
+                use_container_width=True,
+                disabled=not uploaded_files,
+            )
 
-        uploaded_files = st.session_state.get(SIDEBAR_UPLOAD_KEY) or []
-        st.button(
-            "Indexer",
-            use_container_width=True,
-            disabled=not uploaded_files,
-            on_click=_request_indexing,
-        )
+        if index_button and uploaded_files:
+            _request_indexing()
         st.button(
             "Réinitialiser base",
             use_container_width=True,
