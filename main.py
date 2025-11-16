@@ -543,6 +543,11 @@ def _fingerprint_upload(uploaded_file: UploadedFile) -> tuple[str, int]:
 
 def _create_chat_document_entry(uploaded_file: UploadedFile) -> tuple[Optional[Dict[str, Any]], List[str]]:
     warnings: List[str] = []
+    prompt_context: Optional[str] = None
+    try:
+        prompt_context = _summarize_file_for_prompt(uploaded_file)
+    except Exception:
+        prompt_context = None
     try:
         chunks, summary, chunk_warnings = load_file_to_chunks(
             uploaded_file,
@@ -589,6 +594,7 @@ def _create_chat_document_entry(uploaded_file: UploadedFile) -> tuple[Optional[D
         "fingerprint": _fingerprint_upload(uploaded_file),
         "pending": True,
         "embedded": False,
+        "prompt_context": prompt_context,
     }
     return entry, warnings
 
@@ -1160,15 +1166,22 @@ def _flatten_json_schema(value: Any, base_path: str = "$") -> List[Dict[str, str
 
 def _summarize_json_for_prompt(data: Any, filename: str) -> str:
     schema_rows = _flatten_json_schema(data)
-    preview_fields = [
-        f"- {row['path']} — {row['type']}"
-        for row in schema_rows[:30]
+    table_header = (
+        "| Nom du champ | Chemin | Type | Description | Obligatoire | Valeurs possibles |\n"
+        "| --- | --- | --- | --- | --- | --- |"
+    )
+    table_rows = [
+        f"| {row['field']} | {row['path']} | {row['type']} |  |  |  |" for row in schema_rows[:50]
     ]
+    preview_fields = [f"- {row['path']} — {row['type']}" for row in schema_rows[:30]]
     return "\n".join(
         [
             f"Fichier JSON {filename} : dictionnaire de données extrait (aperçu).",
             "Champs détectés :",
             *preview_fields,
+            "Tableau de dictionnaire de données (prévisualisation) :",
+            table_header,
+            *table_rows,
             "Ces éléments servent à construire un tableau de dictionnaire de données (Nom, Chemin, Type, Description, Obligatoire, Valeurs possibles).",
         ]
     )
@@ -1254,6 +1267,23 @@ def _collect_attachment_notes(uploads: Sequence[UploadedFile], images: Sequence[
             f"{name} : image ({format_bytes(size) if size else 'taille inconnue'}). Utiliser gpt-5.1 vision pour décrire ou extraire les éléments visibles."
         )
     return notes
+
+
+def _build_attachment_contexts() -> str:
+    """Aggregate rich previews of uploaded files to feed the LLM without displaying them."""
+
+    contexts: List[str] = []
+    for doc in st.session_state.get("chat_documents", []) or []:
+        block = doc.get("prompt_context") or ""
+        if block:
+            contexts.append(block)
+
+    max_blocks = 3
+    trimmed = contexts[:max_blocks]
+    text = "\n\n".join(trimmed)
+    if len(text) > 6000:
+        text = text[:6000] + "\n\n[Aperçu tronqué pour respecter la limite de tokens]"
+    return text
 
 
 def responses_stream(
@@ -2111,6 +2141,8 @@ def _render_chat_interface() -> None:
             if label not in doc_registry:
                 doc_registry.append(label)
 
+        attachment_contexts = _build_attachment_contexts()
+
         analysis_directives = (
             "Consignes d'analyse des fichiers :\n"
             "- Utilise le contexte RAG et les pièces jointes pour répondre sans recopier le contenu brut.\n"
@@ -2143,6 +2175,8 @@ def _render_chat_interface() -> None:
                 sections.append(attachment_section)
             if registry_section:
                 sections.append(registry_section)
+            if attachment_contexts:
+                sections.append("Aperçu des fichiers fournis (résumé pour le LLM) :\n" + attachment_contexts)
             sys_prefix_content = "\n\n".join(sections) + "\n\n"
             sys_prefix_content += (
                 "CONTEXTE DISPONIBLE :\n"
@@ -2167,6 +2201,10 @@ def _render_chat_interface() -> None:
                 sys_prefix_content += attachment_section + "\n\n"
             if registry_section:
                 sys_prefix_content += registry_section + "\n\n"
+            if attachment_contexts:
+                sys_prefix_content += (
+                    "Aperçu des fichiers fournis (résumé pour le LLM) :\n" + attachment_contexts + "\n\n"
+                )
             sys_prefix_content += (
                 "QUESTION UTILISATEUR :\n"
                 "----------------------\n"
