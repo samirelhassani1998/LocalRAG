@@ -1,11 +1,14 @@
+import json
 import os
 import re
 import urllib.parse as _url
+from dataclasses import replace
 from html import escape
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Sequence
 from types import SimpleNamespace
-from dataclasses import replace
+
+import pandas as pd
 
 import streamlit as st
 from streamlit.runtime.uploaded_file_manager import UploadedFile
@@ -45,17 +48,15 @@ CFG: PerfConfig = PerfConfig(quality_escalation=QUALITY_ESCALATION_ENABLED)
 
 AVAILABLE_MODELS = [
     "gpt-5.1",
-    "gpt-5.1-mini",
     "gpt-5",
-    "gpt-5-mini",
 ]
 
 
-PREFERRED_MODELS = ["gpt-5.1", "gpt-5.1-mini", "gpt-5", "gpt-5-mini"]
+PREFERRED_MODELS = ["gpt-5.1", "gpt-5"]
 
 
 EMBEDDING_MODEL = "text-embedding-3-large"
-VISION_MODELS = {"gpt-5.1", "gpt-5.1-mini", "gpt-5", "gpt-5-mini"}
+VISION_MODELS = {"gpt-5.1", "gpt-5"}
 MAX_INPUT_TOKENS = 300_000
 RESERVE_OUTPUT_TOKENS = 1_000
 MAX_RAG_CONTEXT_TOKENS = 30_000
@@ -116,7 +117,11 @@ MAX_TOKENS_MAX = 8192
 
 
 BASE_GLOBAL_SYSTEM_PROMPT = (
-    "Tu es un assistant conversationnel utile et professionnel. Réponds en français lorsque c'est pertinent."
+    "Tu es un assistant conversationnel utile et professionnel. Réponds en français lorsque c'est pertinent. "
+    "Utilise l'historique du chat et les fichiers fournis (RAG) pour formuler une réponse synthétique sans recopier le contenu brut. "
+    "Quand des JSON sont présents et que l'utilisateur demande un dictionnaire de données, produis un tableau Markdown avec les colonnes : "
+    "Nom du champ | Chemin | Type | Description | Obligatoire (oui/non) | Valeurs possibles. "
+    "Ne renvoie jamais l'intégralité des fichiers : résume, structure et interprète les éléments essentiels."
 )
 FORMAT_ENFORCEMENT_BLOCK = """
 FORMAT DE SORTIE OBLIGATOIRE
@@ -227,6 +232,7 @@ def _init_session_state() -> None:
         "chat_doc_metas": [],
         "chat_doc_index": None,
         "chat_doc_embedding_model": EMBEDDING_MODEL,
+        "chat_attachment_notes": [],
         "show_logs": False,
         "last_call_log": None,
         "_sidebar_feedback": None,
@@ -257,6 +263,7 @@ def _reset_chat() -> None:
     st.session_state.chat_doc_embedding_model = EMBEDDING_MODEL
     st.session_state[CHAT_FILE_BUFFER_KEY] = []
     st.session_state["_chat_file_warning"] = []
+    st.session_state.chat_attachment_notes = []
 
 
 def _reset_rag_state() -> None:
@@ -1110,6 +1117,145 @@ def _message_to_text(message: Optional[Dict[str, Any]]) -> str:
     return str(content)
 
 
+def _flatten_json_schema(value: Any, base_path: str = "$") -> List[Dict[str, str]]:
+    """Extract a lightweight schema from JSON content for the prompt."""
+
+    stack: List[tuple[Any, str]] = [(value, base_path)]
+    rows: List[Dict[str, str]] = []
+    visited = 0
+    max_rows = 120
+
+    def _type_name(val: Any) -> str:
+        if isinstance(val, dict):
+            return "objet"
+        if isinstance(val, list):
+            return "liste"
+        if val is None:
+            return "null"
+        return type(val).__name__
+
+    while stack and len(rows) < max_rows:
+        current, path = stack.pop()
+        visited += 1
+        if visited > 5_000:
+            break
+        if isinstance(current, dict):
+            for key, val in list(current.items())[:50]:
+                child_path = f"{path}.{key}"
+                rows.append({"field": str(key), "path": child_path, "type": _type_name(val)})
+                if isinstance(val, (dict, list)):
+                    stack.append((val, child_path))
+        elif isinstance(current, list):
+            sample = current[:10]
+            rows.append({"field": "[n]", "path": f"{path}[ ]", "type": _type_name(sample[0]) if sample else "vide"})
+            for idx, val in enumerate(sample):
+                child_path = f"{path}[{idx}]"
+                if isinstance(val, (dict, list)):
+                    stack.append((val, child_path))
+        else:
+            rows.append({"field": path.split(".")[-1], "path": path, "type": _type_name(current)})
+
+    return rows[:max_rows]
+
+
+def _summarize_json_for_prompt(data: Any, filename: str) -> str:
+    schema_rows = _flatten_json_schema(data)
+    preview_fields = [
+        f"- {row['path']} — {row['type']}"
+        for row in schema_rows[:30]
+    ]
+    return "\n".join(
+        [
+            f"Fichier JSON {filename} : dictionnaire de données extrait (aperçu).",
+            "Champs détectés :",
+            *preview_fields,
+            "Ces éléments servent à construire un tableau de dictionnaire de données (Nom, Chemin, Type, Description, Obligatoire, Valeurs possibles).",
+        ]
+    )
+
+
+def _summarize_tabular_for_prompt(df: pd.DataFrame, filename: str) -> str:
+    if df.empty:
+        return f"{filename} : tableau vide."
+    head_preview = df.head(5).to_markdown(index=False)
+    info_lines = [
+        f"- Colonnes ({len(df.columns)}) : {', '.join(str(c) for c in df.columns)}",
+        f"- Nombre de lignes (approx.) : {len(df):,}",
+        f"- Types détectés : {', '.join(str(t) for t in df.dtypes.values)}",
+    ]
+    return "\n".join(
+        [
+            f"{filename} : aperçu du tableau.",
+            *info_lines,
+            "- Échantillon (5 premières lignes en Markdown) :",
+            head_preview,
+        ]
+    )
+
+
+def _summarize_file_for_prompt(uploaded_file: UploadedFile) -> Optional[str]:
+    name = getattr(uploaded_file, "name", "document") or "document"
+    extension = _uploaded_file_extension(uploaded_file)
+
+    try:
+        data = uploaded_file.getvalue()
+    except Exception:
+        return f"{name} : impossible de lire le contenu pour l'analyse rapide."
+
+    if not data:
+        return f"{name} : fichier vide."
+
+    try:
+        if extension in {"csv", "tsv"}:
+            sep = "\t" if extension == "tsv" else ","
+            df = pd.read_csv(BytesIO(data), sep=sep, nrows=200)
+            return _summarize_tabular_for_prompt(df, name)
+        if extension in {"xls", "xlsx"}:
+            df = pd.read_excel(BytesIO(data), nrows=200)
+            return _summarize_tabular_for_prompt(df, name)
+        if extension in {"json", "ndjson"}:
+            try:
+                text = data.decode("utf-8")
+            except Exception:
+                text = data.decode(errors="ignore")
+            try:
+                if extension == "ndjson":
+                    lines = [json.loads(line) for line in text.splitlines() if line.strip()][:50]
+                    parsed = lines if len(lines) > 1 else (lines[0] if lines else {})
+                else:
+                    parsed = json.loads(text)
+            except Exception:
+                return f"{name} : JSON illisible, pensez à vérifier la syntaxe."
+            return _summarize_json_for_prompt(parsed, name)
+        if extension in {"txt", "md"}:
+            snippet = data[:800].decode(errors="ignore")
+            return f"{name} : texte brut (aperçu 800 caractères) :\n{snippet.strip()}"
+        if extension in {"pdf", "docx"}:
+            return f"{name} : document analysé et indexé pour le RAG (contenu disponible dans le contexte)."
+        if extension in {"png", "jpg", "jpeg", "webp", "gif"}:
+            size = len(data)
+            return f"{name} : image ({format_bytes(size)}). Utiliser l'analyse vision pour extraire les informations visuelles."
+    except Exception:
+        return f"{name} : analyse rapide indisponible, le contenu reste indexé."
+
+    return None
+
+
+def _collect_attachment_notes(uploads: Sequence[UploadedFile], images: Sequence[Dict[str, Any]]) -> List[str]:
+    notes: List[str] = []
+    for uploaded in uploads or []:
+        summary = _summarize_file_for_prompt(uploaded)
+        if summary:
+            notes.append(summary)
+    for img in images or []:
+        name = img.get("name") or "Image"
+        size = img.get("size_bytes") or 0
+        notes.append(
+            f"{name} : image ({format_bytes(size) if size else 'taille inconnue'}). Utiliser gpt-5.1 vision pour décrire ou extraire les éléments visibles."
+        )
+    return notes
+
+
 def responses_stream(
     client: OpenAI,
     model: str,
@@ -1703,7 +1849,7 @@ def _render_chat_interface() -> None:
 
         selected_model = st.session_state.selected_model
         if image_parts and selected_model not in VISION_MODELS:
-            st.warning("Ce modèle n’accepte pas d’images. Choisissez gpt-5/gpt-5-mini/gpt-5.1/gpt-5.1-mini.")
+            st.warning("Ce modèle n’accepte pas d’images. Choisissez gpt-5 ou gpt-5.1.")
             return
 
         if image_parts:
@@ -1713,6 +1859,11 @@ def _render_chat_interface() -> None:
             user_content.extend(image_parts)
         else:
             user_content = text_value or "(Pièces jointes uniquement)"
+
+        st.session_state.chat_attachment_notes = _collect_attachment_notes(
+            list(st.session_state.chat_attachments),
+            list(st.session_state.chat_images),
+        )
 
         user_payload: Dict[str, Any] = {"role": "user", "content": user_content}
         if attachments:
@@ -1947,6 +2098,39 @@ def _render_chat_interface() -> None:
         if question_text is None:
             question_text = text_value or query_for_rag
 
+        attachment_notes = st.session_state.get("chat_attachment_notes") or []
+        doc_registry: List[str] = []
+        for summary in st.session_state.get("rag_docs", []) or []:
+            label = f"- {summary.get('name', 'document')} ({summary.get('type', 'n/a')})"
+            if label not in doc_registry:
+                doc_registry.append(label)
+        for chat_doc in st.session_state.get("chat_documents", []) or []:
+            name = chat_doc.get("name") or "document"
+            dtype = chat_doc.get("summary", {}).get("type") or chat_doc.get("mime") or "chat"
+            label = f"- {name} ({dtype})"
+            if label not in doc_registry:
+                doc_registry.append(label)
+
+        analysis_directives = (
+            "Consignes d'analyse des fichiers :\n"
+            "- Utilise le contexte RAG et les pièces jointes pour répondre sans recopier le contenu brut.\n"
+            "- Préfère des synthèses structurées. Pour JSON : retourne un tableau de dictionnaire de données (Nom du champ | Chemin | Type | Description | Obligatoire (oui/non) | Valeurs possibles) quand c'est demandé.\n"
+            "- Pour CSV/Excel : décris les colonnes, types et statistiques simples à partir de l'aperçu fourni.\n"
+            "- Pour PDF/DOC/TXT/MD : résume le texte pertinent.\n"
+            "- Pour les images : exploite gpt-5.1 vision pour décrire ce qui est visible selon la question.\n"
+            "- Ne renvoie pas l'intégralité des fichiers ; privilégie les interprétations utiles."
+        )
+
+        attachment_section = ""
+        if attachment_notes:
+            attachment_section = "Fichiers du message en cours :\n" + "\n".join(
+                f"- {note}" for note in attachment_notes
+            )
+
+        registry_section = ""
+        if doc_registry:
+            registry_section = "Fichiers déjà indexés durant la session :\n" + "\n".join(doc_registry)
+
         if formatted_context:
             instructions = (
                 "Tu es un assistant qui répond uniquement à partir des documents fournis dans le RAG et les pièces jointes du chat.\n"
@@ -1954,11 +2138,18 @@ def _render_chat_interface() -> None:
             )
             if chat_hits:
                 instructions += "\nPriorise aussi les extraits issus des pièces jointes du chat."
-            sys_prefix_content = (
-                f"{instructions}\n\n"
+            sections = [instructions, analysis_directives]
+            if attachment_section:
+                sections.append(attachment_section)
+            if registry_section:
+                sections.append(registry_section)
+            sys_prefix_content = "\n\n".join(sections) + "\n\n"
+            sys_prefix_content += (
                 "CONTEXTE DISPONIBLE :\n"
                 "--------------------\n"
                 f"{formatted_context}\n\n"
+            )
+            sys_prefix_content += (
                 "QUESTION UTILISATEUR :\n"
                 "----------------------\n"
                 f"{question_text}\n\n"
@@ -1970,6 +2161,13 @@ def _render_chat_interface() -> None:
         else:
             sys_prefix_content = (
                 "Aucun document externe n'est disponible pour cette question. Réponds avec tes connaissances générales et fais-le savoir si nécessaire.\n\n"
+                f"{analysis_directives}\n\n"
+            )
+            if attachment_section:
+                sys_prefix_content += attachment_section + "\n\n"
+            if registry_section:
+                sys_prefix_content += registry_section + "\n\n"
+            sys_prefix_content += (
                 "QUESTION UTILISATEUR :\n"
                 "----------------------\n"
                 f"{question_text}"
