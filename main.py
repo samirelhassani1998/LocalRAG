@@ -1102,6 +1102,44 @@ def _format_usage(usage: Optional[Dict[str, int]]) -> Optional[str]:
     return "Usage tokens — " + ", ".join(parts)
 
 
+def _user_wants_raw_content(question: str) -> bool:
+    """Detect explicit requests for raw/complete file dumps."""
+
+    lowered = question.lower()
+    trigger_phrases = [
+        "contenu brut",
+        "json complet",
+        "affiche le json",
+        "affiche-moi le json",
+        "montre-moi le json",
+        "montre moi le json",
+        "affiche le fichier",
+        "montre le fichier",
+        "dump complet",
+        "raw output",
+        "raw content",
+    ]
+    return any(token in lowered for token in trigger_phrases)
+
+
+def _build_context_snippets(hits: Sequence[tuple[str, Dict[str, Any], float]] | None, *, limit: int = 8) -> str:
+    """Produce compact context snippets for the LLM prompt."""
+
+    if not hits:
+        return ""
+
+    def _trim(text: str, max_len: int = 1200) -> str:
+        if len(text) <= max_len:
+            return text
+        return text[:max_len] + "\n[Extrait tronqué]"
+
+    snippets: List[str] = []
+    for idx, (chunk, meta, _score) in enumerate(hits[:limit], start=1):
+        descriptor = format_source_badge(meta, idx)
+        snippets.append(f"[Source {idx} — {descriptor}] {_trim(chunk or '')}")
+    return "\n\n".join(snippets)
+
+
 def _message_to_text(message: Optional[Dict[str, Any]]) -> str:
     """Return the textual portion of a chat message (ignoring images)."""
 
@@ -2078,12 +2116,8 @@ def _render_chat_interface() -> None:
             st.session_state.last_call_log = call_context
             return
 
-        _ensure_global_system_message()
 
-        messages_for_api = [
-            {"role": msg.get("role"), "content": msg.get("content")}
-            for msg in st.session_state.messages
-        ]
+        _ensure_global_system_message()
 
         sources_info: List[Dict[str, Any]] = []
 
@@ -2107,21 +2141,20 @@ def _render_chat_interface() -> None:
         truncated_history_flag = False
         selected_model = st.session_state.selected_model
 
+        formatted_context = ""
         if combined_hits:
             formatted_context, truncated_context_flag = format_context(
                 combined_hits,
                 model=selected_model,
                 max_tokens=MAX_RAG_CONTEXT_TOKENS,
             )
-        else:
-            formatted_context = ""
 
-        last_user_for_prompt = next(
-            (msg for msg in reversed(messages_for_api) if msg.get("role") == "user"),
+        last_user_message = next(
+            (msg for msg in reversed(st.session_state.messages) if msg.get("role") == "user"),
             None,
         )
         question_text = (
-            (_message_to_text(last_user_for_prompt) or "").strip()
+            (_message_to_text(last_user_message) or "").strip()
             or (text_value or query_for_rag)
         )
 
@@ -2142,10 +2175,13 @@ def _render_chat_interface() -> None:
                 doc_registry.append(label)
 
         attachment_contexts = _build_attachment_contexts()
+        context_snippets = _build_context_snippets(combined_hits)
+        if not context_snippets and formatted_context:
+            context_snippets = formatted_context
 
         analysis_directives = (
             "Consignes d'analyse des fichiers :\n"
-            "- Utilise le contexte RAG et les pièces jointes pour répondre sans recopier le contenu brut.\n"
+            "- Utilise le contexte RAG et les pièces jointes pour répondre sans recopier le contenu brut (sauf demande explicite).\n"
             "- Préfère des synthèses structurées. Pour JSON : retourne un tableau de dictionnaire de données (Nom du champ | Chemin | Type | Description | Obligatoire (oui/non) | Valeurs possibles) quand c'est demandé.\n"
             "- Pour CSV/Excel : décris les colonnes, types et statistiques simples à partir de l'aperçu fourni.\n"
             "- Pour PDF/DOC/TXT/MD : résume le texte pertinent.\n"
@@ -2163,56 +2199,52 @@ def _render_chat_interface() -> None:
         if doc_registry:
             registry_section = "Fichiers déjà indexés durant la session :\n" + "\n".join(doc_registry)
 
-        if formatted_context:
-            instructions = (
-                "Tu es un assistant qui répond uniquement à partir des documents fournis dans le RAG et les pièces jointes du chat.\n"
-                "Ne dis jamais que tu ne peux pas lire les fichiers : ils ont déjà été analysés."
-            )
-            if chat_hits:
-                instructions += "\nPriorise aussi les extraits issus des pièces jointes du chat."
-            sections = [instructions, analysis_directives]
-            if attachment_section:
-                sections.append(attachment_section)
-            if registry_section:
-                sections.append(registry_section)
-            if attachment_contexts:
-                sections.append("Aperçu des fichiers fournis (résumé pour le LLM) :\n" + attachment_contexts)
-            sys_prefix_content = "\n\n".join(sections) + "\n\n"
-            sys_prefix_content += (
-                "CONTEXTE DISPONIBLE :\n"
-                "--------------------\n"
-                f"{formatted_context}\n\n"
-            )
-            sys_prefix_content += (
-                "QUESTION UTILISATEUR :\n"
-                "----------------------\n"
-                f"{question_text}\n\n"
-                "DIRECTIVES :\n"
-                "1. Cite les sources au format [n] en fin de paragraphe.\n"
-                "2. Si les documents ne répondent pas, écris explicitement \"Je ne sais pas\".\n"
-                "3. Liste les sources exploitées à la fin de la réponse."
+        wants_raw_sources = _user_wants_raw_content(question_text or "")
+
+        user_prompt_parts = [
+            "Voici des extraits de documents (RAG) à utiliser comme contexte pour répondre à ma question. Ne recopie pas les extraits tels quels, sauf si je le demande explicitement.",
+            analysis_directives,
+            f"Question : {question_text}",
+            f"Contexte RAG :\n{context_snippets or '(aucun extrait pertinent)'}",
+        ]
+        if attachment_section:
+            user_prompt_parts.append(attachment_section)
+        if registry_section:
+            user_prompt_parts.append(registry_section)
+        if attachment_contexts:
+            user_prompt_parts.append("Aperçu des fichiers fournis (résumé pour le LLM) :\n" + attachment_contexts)
+        if wants_raw_sources:
+            user_prompt_parts.append(
+                "L'utilisateur souhaite voir le contenu brut des sources. Fournis-le explicitement si possible, sinon explique pourquoi."
             )
         else:
-            sys_prefix_content = (
-                "Aucun document externe n'est disponible pour cette question. Réponds avec tes connaissances générales et fais-le savoir si nécessaire.\n\n"
-                f"{analysis_directives}\n\n"
-            )
-            if attachment_section:
-                sys_prefix_content += attachment_section + "\n\n"
-            if registry_section:
-                sys_prefix_content += registry_section + "\n\n"
-            if attachment_contexts:
-                sys_prefix_content += (
-                    "Aperçu des fichiers fournis (résumé pour le LLM) :\n" + attachment_contexts + "\n\n"
-                )
-            sys_prefix_content += (
-                "QUESTION UTILISATEUR :\n"
-                "----------------------\n"
-                f"{question_text}"
+            user_prompt_parts.append(
+                "Réponds en français avec une synthèse structurée (tableaux Markdown, listes, hypothèses quand nécessaire)."
             )
 
-        sys_prefix = {"role": "system", "content": sys_prefix_content}
-        messages_for_api = [sys_prefix] + messages_for_api
+        user_prompt_content = "\n\n".join(user_prompt_parts)
+        augmented_last_user_content: Any = user_prompt_content
+        if image_parts:
+            augmented_last_user_content = (
+                [{"type": "text", "text": user_prompt_content}] + image_parts
+            )
+
+        guidance_system_message = {
+            "role": "system",
+            "content": (
+                "Tu es un assistant qui exploite prioritairement le contexte RAG et l'historique du chat. "
+                "Ne renvoie pas les extraits tels quels sauf demande explicite. "
+                "Conserve le fil de la conversation et détaille les hypothèses lorsque l'information manque."
+            ),
+        }
+
+        messages_for_api: List[Dict[str, Any]] = [guidance_system_message]
+        for msg in st.session_state.messages:
+            entry = {"role": msg.get("role"), "content": msg.get("content")}
+            if msg is last_user_message:
+                entry["content"] = augmented_last_user_content
+            messages_for_api.append(entry)
+
         sources_info = _build_source_entries(combined_hits) if combined_hits else []
 
         rag_hits_count = len(rag_hits)
@@ -2233,7 +2265,6 @@ def _render_chat_interface() -> None:
             None,
         )
         is_multimodal_request = _contains_image_parts(last_user_for_api)
-
         call_context: Dict[str, Any] = {
             "model": selected_model,
             "call_type": "Responses API" if is_multimodal_request else "Chat Completions",
@@ -2334,6 +2365,15 @@ def _render_chat_interface() -> None:
                 sources_line = _format_sources_line(sources_info)
                 if sources_line:
                     sources_placeholder.caption(sources_line)
+
+                if wants_raw_sources and combined_hits:
+                    with st.expander("Sources RAG (contenu brut demandé)", expanded=False):
+                        for idx, (chunk_text, meta, _score) in enumerate(combined_hits, start=1):
+                            st.markdown(f"**Source {idx} — {format_source_badge(meta, idx)}**")
+                            st.code(
+                                chunk_text,
+                                language="json" if (chunk_text or "").lstrip().startswith("{") else None,
+                            )
 
                 usage_text = _format_usage(usage_holder["usage"])
                 if usage_text:
