@@ -1,74 +1,181 @@
-# ChatGPT-like Streamlit Chatbot
+# LocalRAG — Chatbot RAG Avancé avec Streamlit
 
-This project recreates a minimal ChatGPT-style user interface using Streamlit and the OpenAI API. Users can supply their own API key directly in the app, pick a model, and begin chatting immediately.
-URL: https://laposte-57sgwe24hqzegfthseuprg.streamlit.app/
+Application de chat conversationnel **style ChatGPT** construite avec Streamlit et l'API OpenAI, enrichie d'un pipeline de **Retrieval-Augmented Generation (RAG)** performant. Indexez vos propres documents et obtenez des réponses contextualisées en quelques clics.
 
-## Features
+🔗 **Démo en ligne** : [laposte-57sgwe24hqzegfthseuprg.streamlit.app](https://laposte-57sgwe24hqzegfthseuprg.streamlit.app/)
 
-- **Inline API key capture**: Provide your OpenAI API key inside the app—no need for `st.secrets`.
-- **Model selection**: Switch between available GPT-5 generation models (GPT-5.1, GPT-5.1 mini, GPT-5, GPT-5 mini) if enabled on your account.
-- **Clean conversation view**: Messages are displayed in a vertically stacked chat log with a chat input area at the bottom of the screen.
-- **Session persistence**: The API key and conversation history live in `st.session_state` during the browsing session.
+---
 
-## Getting Started
+## ✨ Fonctionnalités Clés
 
-### Prerequisites
+| Catégorie | Description |
+|-----------|-------------|
+| **Chat Intelligent** | Interface conversationnelle fluide avec streaming des réponses en temps réel |
+| **RAG Avancé** | Indexation vectorielle FAISS, embeddings OpenAI `text-embedding-3-large`, reranking cross-encoder |
+| **Multi-formats** | Support CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON (y compris NDJSON) |
+| **Vision** | Prise en charge des images (GPT-5.1, GPT-5) pour analyse visuelle |
+| **Mode Qualité** | Multi-pass generation, MMR search (λ=0.35), top-k=8, reranking automatique |
+| **Session Sécurisée** | Clé API saisie directement dans l'UI, données en mémoire uniquement |
+
+---
+
+## 🏗️ Architecture du Projet
+
+```
+LocalRAG/
+├── main.py               # Application Streamlit principale (~2450 lignes)
+├── rag_utils.py          # Ingestion de documents, chunking, embeddings
+├── config.py             # Configuration RAG (PerfConfig dataclass)
+├── adapters.py           # Conversion messages → schéma OpenAI Chat/Responses
+├── token_utils.py        # Comptage et troncature de tokens
+├── image_utils.py        # Traitement d'images pour vision
+├── responses_schema.py   # Schémas de réponses structurées
+├── rag/                  # Module RAG avancé
+│   ├── pipeline.py       # Orchestration du pipeline RAG complet
+│   ├── retriever.py      # Logique de récupération et reranking
+│   ├── memory.py         # Résumé de l'historique de conversation
+│   └── prompts.py        # Templates de prompts système
+├── utils/                # Utilitaires
+│   ├── rendering.py      # Rendu et formatage
+│   └── text_normalize.py # Normalisation de texte
+├── quality/              # Modules d'amélioration de qualité
+├── tests/                # Tests unitaires
+├── .streamlit/           # Configuration Streamlit
+└── requirements.txt      # Dépendances Python
+```
+
+---
+
+## 🚀 Installation & Démarrage
+
+### Prérequis
 
 - Python 3.9+
-- An OpenAI API key with access to the desired models
+- Clé API OpenAI (avec accès aux modèles GPT)
 
 ### Installation
 
 ```bash
+# Cloner le repository
+git clone https://github.com/votre-username/LocalRAG.git
+cd LocalRAG
+
+# Créer un environnement virtuel
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # Linux/macOS
+# ou .venv\Scripts\activate  # Windows
+
+# Installer les dépendances
 pip install -r requirements.txt
 ```
 
-### Running the App
+### Lancement
 
 ```bash
 streamlit run main.py
 ```
 
-Open the provided local URL in your browser. The app will first ask for your API key. Once provided, it reveals the chat interface.
+L'application s'ouvre dans votre navigateur. Entrez votre clé API OpenAI pour commencer.
 
-### Environment Variables (Optional)
+---
 
-If you do not want to type your API key every time, you can create a `.env` file at the project root and set `OPENAI_API_KEY=...`. The app will load it automatically on startup, but the key can still be changed from the UI at any time.
+## 📄 Workflow RAG
 
-Additional knobs for advanced usage:
+1. **Upload de documents** — Glissez-déposez jusqu'à 5 fichiers (20 Mo max par défaut) dans la sidebar
+2. **Indexation automatique** — Chunking intelligent (~4000 caractères, 400 overlap), création de l'index FAISS
+3. **Recherche contextuelle** — MMR (Maximal Marginal Relevance) + reranking cross-encoder
+4. **Génération multi-pass** — Première réponse puis amélioration automatique
+5. **Réponses sourcées** — Chaque réponse cite ses sources avec numérotation
 
-- `QUALITY_ESCALATION=0` — disables the automatic multi-pass / reranker escalation (enabled by default for maximum quality).
+### Types de fichiers supportés
 
-## Customization
+| Format | Extensions | Particularités |
+|--------|------------|----------------|
+| Texte | `.txt`, `.md` | Encodage auto-détecté |
+| Tableur | `.csv`, `.tsv`, `.xlsx`, `.xls` | Parsing par feuilles/lignes |
+| Document | `.pdf`, `.docx` | Extraction par pages |
+| Données | `.json` | Support NDJSON et streaming |
 
-- Update the list of models in `main.py` to match the ones available on your account.
-- Adjust the theme colors in `.streamlit/config.toml` to tweak the look and feel.
+---
 
-## RAG & Upload
+## ⚙️ Configuration
 
-The chat interface now includes an optional retrieval-augmented generation (RAG) workflow:
+### Variables d'environnement
 
-- **Drag & drop documents** directly in the sidebar (`csv`, `xlsx`, `xls`, `pdf`, `docx`, `txt`, `md`). Up to five files can be indexed at a time and the per-file limit defaults to 20&nbsp;MB (configurable).
-- **On-demand indexing** builds an in-memory FAISS index for the current session using OpenAI's `text-embedding-3-large` model. Files are read in memory only; nothing is persisted on disk and the API key never leaves the session.
-- **Chunking & metadata**: each document is normalized, chunked (~4 000 chars with 400-char overlap), and enriched with metadata (source file, page/sheet/row range when applicable).
-- **Contextual answers**: when the index is populated, every new user question retrieves the top-8 chunks (MMR + reranker) and injects them into the system prompt. Responses cite their sources and a badge indicates when RAG is active.
-- **Reset anytime**: use the “Réinitialiser base” button to clear the FAISS index and associated documents from the session state.
+| Variable | Défaut | Description |
+|----------|--------|-------------|
+| `OPENAI_API_KEY` | — | Clé API OpenAI (optionnel si saisi dans l'UI) |
+| `MAX_FILE_MB` | `20` | Taille maximale par fichier (Mo) |
+| `ALLOW_LARGE_FILES` | `true` | Traitement chunké des gros fichiers |
+| `MAX_TOTAL_CHARS` | — | Limite totale de caractères ingérés |
+| `QUALITY_ESCALATION` | `1` | Active le mode qualité avancé (0 pour désactiver) |
 
-By default the chatbot now runs in "mode qualité" with aggressive retrieval settings (`k=8`, MMR fetch 40, cross-encoder reranking, multi-pass generation and 2 000 output tokens). Those options are baked into the code for maximum robustness and no longer appear in the sidebar.
+### Configuration RAG (`config.py`)
 
-The sidebar summarises the indexed corpus (file sizes, estimated tokens, chunk counts, embedding model). If a PDF contains no extractable text (e.g. scanned documents), the app warns you and skips it.
+```python
+@dataclass(frozen=True)
+class PerfConfig:
+    default_model: str = "gpt-5.1"
+    rag_k: int = 8                 # Nombre de chunks récupérés
+    use_mmr: bool = True           # Maximal Marginal Relevance
+    mmr_fetch_k: int = 40          # Taille du pool de candidats MMR
+    mmr_lambda: float = 0.35       # Balance pertinence/diversité
+    use_reranker: bool = True      # Cross-encoder reranking
+    use_multipass: bool = True     # Génération en 2 passes
+    temperature: float = 0.3
+    max_tokens: int = 2000
+```
 
-## Limites et gros fichiers
+---
 
-- La limite d'upload est gouvernée par `DEFAULT_MAX_FILE_MB` (20&nbsp;Mo par défaut). Surcharger `MAX_FILE_MB` via `st.secrets` ou une variable d'environnement permet d'augmenter ou diminuer ce plafond.
-- Quand `ALLOW_LARGE_FILES` vaut `true` (valeur par défaut), les documents au-delà de cette limite sont traités par morceaux plutôt qu'ignorés : CSV/TSV sont lus par blocs (`CSV_CHUNKSIZE_ROWS`), les classeurs Excel feuille par feuille (`EXCEL_MAX_SHEETS`), et les PDF page par page (`PDF_MAX_PAGES`). Les fichiers texte/DOCX suivent le flux habituel.
-- `MAX_TOTAL_CHARS` borne le volume total de caractères ingérés pour éviter des coûts d'embeddings ou une consommation mémoire disproportionnée. Adaptez ce paramètre selon vos contraintes.
-- Pour désactiver le traitement chunké et retrouver l'ancien comportement (fichiers volumineux ignorés), définissez `ALLOW_LARGE_FILES=false` dans l'environnement ou `st.secrets`.
-- Si vous relevez `MAX_FILE_MB` au-delà de 200, pensez à synchroniser la configuration Streamlit (`.streamlit/config.toml`, clé `server.maxUploadSize`) afin que l'upload navigateur/serveur suive.
-- Les fichiers massifs génèrent davantage de chunks et donc plus d'embeddings : surveillez vos coûts OpenAI, surtout avec `text-embedding-3-large`.
+## 🔧 Fonctionnalités Avancées
 
-## License
+### Mode Vision
 
-This project is released under the [MIT License](LICENSE).
+Les modèles GPT-5.1 et GPT-5 supportent l'analyse d'images. Uploadez des images dans le chat pour obtenir des descriptions, analyses ou réponses contextuelles.
+
+### Gros Fichiers
+
+- Fichiers > `MAX_FILE_MB` traités par morceaux (streaming)
+- CSV/TSV : lecture par blocs
+- Excel : feuille par feuille
+- PDF : page par page
+
+### Reranking Intelligent
+
+1. **Cross-Encoder** (MS-MARCO MiniLM L-6) — scoring sémantique précis
+2. **BM25 Fallback** — algorithme lexical si cross-encoder indisponible
+
+---
+
+## 📦 Dépendances Principales
+
+- `streamlit` — Interface web
+- `openai` — API OpenAI
+- `faiss-cpu` — Indexation vectorielle
+- `sentence-transformers` — Cross-encoder reranking
+- `pypdf` — Extraction PDF
+- `python-docx` — Extraction DOCX
+- `pandas` / `openpyxl` — Traitement tableurs
+- `tiktoken` — Comptage de tokens
+- `rank-bm25` — Reranking BM25
+
+---
+
+## 🎨 Personnalisation
+
+- **Modèles** : Modifiez `AVAILABLE_MODELS` dans `main.py`
+- **Thème** : Ajustez `.streamlit/config.toml`
+- **Prompts** : Éditez `rag/prompts.py` et `BASE_GLOBAL_SYSTEM_PROMPT`
+
+---
+
+## 📝 Licence
+
+Ce projet est distribué sous licence [MIT](LICENSE).
+
+---
+
+## 🤝 Contribution
+
+Les contributions sont bienvenues ! Ouvrez une issue ou soumettez une pull request.
